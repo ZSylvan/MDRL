@@ -1,0 +1,11 @@
+id: mdrl-exp001-batch-capacity
+train_config: configs/train/train_MDRL_reproduction.yml
+output_root: /home/zhuenqiang_1/Student_Project/zms/experiment_data/mdrl/batch_probe
+device: cuda:0
+batch_sizes: [8, 16, 24, 32, 48, 64, 96, 128]
+warmup_steps: 3
+measured_steps: 20
+stress_steps: 2
+candidate_timeout_seconds: 600
+# A recommendation is diagnostic only; it never changes the training YAML.
+max_memory_fraction: 0.80

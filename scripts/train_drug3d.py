@@ -2,6 +2,7 @@ import sys
 import os
 import shutil
 import argparse
+import distutils.version
 sys.path.append('.')
 
 from tqdm import tqdm
@@ -16,31 +17,11 @@ from utils.dataset import get_dataset
 from utils.transforms import FeaturizeMol, Compose
 from utils.misc import *
 from utils.train import *
+from utils.pretrain_record import PretrainRecord, git_version
 
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/train/train_MDRL.yml')
-    parser.add_argument('--device', type=str, default='cuda:0')
-    parser.add_argument('--logdir', type=str, default='logs')
-    args = parser.parse_args()
-
-    # Load configs
-    config = load_config(args.config)
-    config_name = os.path.basename(args.config)[:os.path.basename(args.config).rfind('.')]
-    seed_all(config.train.seed)
-
-    # Logging
-    log_dir = get_new_log_dir(args.logdir, prefix=config_name)
-    ckpt_dir = os.path.join(log_dir, 'checkpoints')
-    os.makedirs(ckpt_dir, exist_ok=True)
-    logger = get_logger('train', log_dir)
-    writer = torch.utils.tensorboard.SummaryWriter(log_dir)
-    logger.info(args)
-    logger.info(config)
-    shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
-
+def run_training(args, config, logger, writer, record):
     # Transforms
     featurizer = FeaturizeMol(config.chem.atomic_numbers, config.chem.mol_bond_types,
                             use_mask_node=config.transform.use_mask_node,
@@ -81,9 +62,6 @@ if __name__ == '__main__':
         raise NotImplementedError('Model %s not implemented' % config.model.name)
     print('Num of trainable parameters is', np.sum([p.numel() for p in model.parameters() if p.requires_grad]))
 
-    from torchsummary import summary
-    summary(model)
-    
     # Optimizer and scheduler
     optimizer = get_optimizer(config.train.optimizer, model)
     scheduler = get_scheduler(config.train.scheduler, optimizer)
@@ -165,29 +143,35 @@ if __name__ == '__main__':
         for k, v in avg_loss_dict.items():
             writer.add_scalar('val/%s' % k, v, it)
         writer.flush()
-        return avg_loss
+        return avg_loss_dict
 
-    try:
-        model.train()
-        for it in range(1, config.train.max_iters+1):
-            try:
-                train(it)
-            except RuntimeError as e:
-                logger.error('Runtime Error ' + str(e))
-                logger.error('Skipping Iteration %d' % it)
-            if it % config.train.val_freq == 0 or it == config.train.max_iters:
-                validate(it)
-                ckpt_path = os.path.join(ckpt_dir, '%d.pt' % it)
-                torch.save({
-                    'config': config,
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'iteration': it,
-                }, ckpt_path)
-                model.train()
-    except KeyboardInterrupt:
-        logger.info('Terminating...')                    
+    model.train()
+    for it in range(1, config.train.max_iters+1):
+        record.state['iteration'] = it
+        record.state['phase'] = 'train'
+        try:
+            train(it)
+            record.state['completed_train_calls'] += 1
+        except RuntimeError as e:
+            logger.error('Runtime Error ' + str(e))
+            logger.error('Skipping Iteration %d' % it)
+            record.record_skip(e)
+        if it % config.train.val_freq == 0 or it == config.train.max_iters:
+            record.state['phase'] = 'validation'
+            validation_losses = validate(it)
+            record.state['phase'] = 'checkpoint'
+            improved = record.save_checkpoint({
+                'config': config,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
+                'iteration': it,
+            }, validation_losses)
+            if improved:
+                logger.info('Best checkpoint: iteration %d, validation loss %.6f',
+                            it, validation_losses['loss'])
+            model.train()
 
     # model.train()
     # for it in range(1, config.train.max_iters+1):
@@ -203,4 +187,45 @@ if __name__ == '__main__':
     #             'iteration': it,
     #         }, ckpt_path)
     #         model.train()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='configs/train/train_MDRL.yml')
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--logdir', type=str, default=None)
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    config_name = os.path.splitext(os.path.basename(args.config))[0]
+    args.logdir = args.logdir or config.get('logdir', 'logs')
+    seed_all(config.train.seed)
+    log_dir = get_new_log_dir(args.logdir, prefix=config_name)
+    os.makedirs(os.path.join(log_dir, 'checkpoints'))
+    logger = get_logger('train', log_dir)
+    logger.info(args)
+    logger.info(config)
+    shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
+    metadata = {
+        'git': git_version(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        'args': vars(args),
+        'config_path': os.path.abspath(args.config),
+        'dataset_root': os.path.abspath(config.dataset.root),
+        'python': sys.version,
+        'executable': sys.executable,
+        'torch': torch.__version__,
+    }
+    try:
+        with PretrainRecord(log_dir, metadata) as record:
+            writer = torch.utils.tensorboard.SummaryWriter(log_dir)
+            try:
+                run_training(args, config, logger, writer, record)
+            finally:
+                writer.close()
+    except KeyboardInterrupt:
+        logger.info('Terminating...')
+        raise
+    except Exception:
+        logger.exception('Pretraining failed')
+        raise
 
