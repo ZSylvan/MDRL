@@ -1,4 +1,4 @@
-"""Prepare one-pass batch-16/24 diagnostics using the existing trainer; never submit."""
+"""Prepare configurable one-pass batch diagnostics using the existing trainer; never submit."""
 
 import argparse
 import copy
@@ -23,14 +23,26 @@ OUTPUT_ROOT = '/home/zhuenqiang_1/Student_Project/zms/experiment_data/mdrl/epoch
 BATCHES = (16, 24)
 
 
-def epoch_configs(base, train_size, directory):
+def validate_batches(batches):
+    batches = tuple(batches)
+    if not batches or any(batch <= 0 for batch in batches) or len(set(batches)) != len(batches):
+        raise ValueError('Batch sizes must be positive and unique')
+    return batches
+
+
+def epoch_configs(base, train_size, directory, batches=BATCHES, num_workers=None):
     if train_size <= 0:
         raise ValueError('The effective original training split is empty')
+    batches = validate_batches(batches)
+    if num_workers is not None and num_workers < 0:
+        raise ValueError('Worker count must be nonnegative')
     configs = {}
-    for batch in BATCHES:
+    for batch in batches:
         config = copy.deepcopy(base)
         config['train']['batch_size'] = batch
         config['train']['max_iters'] = (train_size + batch - 1) // batch
+        if num_workers is not None:
+            config['train']['num_workers'] = num_workers
         config['logdir'] = str(Path(directory) / ('batch_%03d' % batch))
         configs[batch] = config
     return configs
@@ -40,7 +52,8 @@ def summarize(directory):
     directory = Path(directory)
     protocol = json.loads((directory / 'protocol.json').read_text(encoding='utf-8'))
     rows = []
-    for batch in BATCHES:
+    batches = validate_batches(protocol.get('batches', [int(batch) for batch in protocol['iterations']]))
+    for batch in batches:
         output = directory / ('batch_%03d' % batch)
         states = list(output.glob('*/run.json'))
         row = {'batch_size': batch, 'status': 'incomplete',
@@ -73,7 +86,8 @@ def summarize(directory):
     return 0 if all(row['status'] == 'passed_one_train_pass_and_validation' for row in rows) else 2
 
 
-def render_pbs(repo, directory, revision, queue, resources, gpu):
+def render_pbs(repo, directory, revision, queue, resources, gpu, batches=BATCHES):
+    batches = validate_batches(batches)
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', queue):
         raise ValueError('Invalid queue')
     if not re.fullmatch(r'[A-Za-z0-9_.,:=+-]+', resources):
@@ -105,6 +119,7 @@ export LD_LIBRARY_PATH="$ENV_ROOT/lib:${{LD_LIBRARY_PATH:-}}"
 export CONDA_PREFIX="$ENV_ROOT" CONDA_DEFAULT_ENV=MDRL
 export PYTHONPATH="$REPO${{PYTHONPATH:+:$PYTHONPATH}}"
 export PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 if [[ -n "${{CUDA_VISIBLE_DEVICES:-}}" && "$CUDA_VISIBLE_DEVICES" != "$GPU" ]]; then
     echo 'ERROR: scheduler GPU mask differs from the requested physical GPU'; exit 2
 fi
@@ -114,7 +129,7 @@ test -x "$PY"
 [[ "$(git rev-parse HEAD)" == "$REV" && -z "$(git status --porcelain)" ]] || {{
     echo 'ERROR: repository changed after preparation'; exit 2;
 }}
-for batch in 16 24; do
+for batch in {' '.join(str(batch) for batch in batches)}; do
     pids=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader)
     [[ -z "$pids" ]] || {{ echo "ERROR: GPU $GPU has active compute processes: $pids"; exit 2; }}
     printf -v label 'batch_%03d' "$batch"
@@ -135,6 +150,10 @@ def main():
     parser.add_argument('--queue')
     parser.add_argument('--resources')
     parser.add_argument('--gpu', type=int)
+    parser.add_argument('--batches', type=int, nargs='+', default=BATCHES,
+                        help='Ordered batch sizes to test in separate processes (default: 16 24)')
+    parser.add_argument('--num-workers', type=int,
+                        help='Override training DataLoader workers; otherwise retain the source config')
     parser.add_argument('--run-id', default='mdrl-exp003-epoch-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'))
     args = parser.parse_args()
     if args.summarize:
@@ -160,14 +179,16 @@ def main():
     train_size = sum(mol_id in index for mol_id in split['train'])
     directory = Path(OUTPUT_ROOT) / args.run_id
     base = json.loads(json.dumps(config))
-    configs = epoch_configs(base, train_size, directory)
-    source = render_pbs(ROOT, directory, version['commit'], args.queue, args.resources, args.gpu)
+    configs = epoch_configs(base, train_size, directory, args.batches, args.num_workers)
+    source = render_pbs(ROOT, directory, version['commit'], args.queue, args.resources, args.gpu, args.batches)
     directory.mkdir(parents=True, exist_ok=False)
     for batch, effective in configs.items():
         with (directory / ('batch_%03d.yml' % batch)).open('x', encoding='utf-8') as handle:
             yaml.safe_dump(effective, handle, sort_keys=False)
     write_json(directory / 'protocol.json', {
         'experiment': 'mdrl-exp003-one-train-pass', 'git': version,
+        'run_id': args.run_id, 'batches': list(configs),
+        'num_workers': next(iter(configs.values()))['train']['num_workers'],
         'train_size': train_size, 'raw_train_split_entries': len(split['train']),
         'iterations': {str(batch): effective['train']['max_iters'] for batch, effective in configs.items()},
         'shuffle': True, 'drop_last': False, 'validation': 'original cadence plus final iteration',

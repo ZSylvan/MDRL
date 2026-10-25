@@ -41,10 +41,31 @@ class EpochProbeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             epoch.epoch_configs(base, 0, self.directory)
 
+    def test_node4_configs_use_requested_batches_and_six_workers(self):
+        base = yaml.safe_load((ROOT / 'configs/train/train_MDRL_reproduction.yml').read_text())
+        original = copy.deepcopy(base)
+        configs = epoch.epoch_configs(base, 231523, self.directory, (12, 16), 6)
+        self.assertEqual(base, original)
+        self.assertEqual(list(configs), [12, 16])
+        for batch, steps in ((12, 19294), (16, 14471)):
+            expected = copy.deepcopy(base)
+            expected['train'].update(batch_size=batch, max_iters=steps, num_workers=6)
+            expected['logdir'] = str(self.directory / ('batch_%03d' % batch))
+            self.assertEqual(configs[batch], expected)
+
+    def test_invalid_batch_lists_and_workers_are_rejected(self):
+        for batches in ((), (0, 16), (-12, 16), (12, 12)):
+            with self.assertRaises(ValueError):
+                epoch.epoch_configs({}, 33, self.directory, batches)
+            with self.assertRaises(ValueError):
+                epoch.render_pbs('/repo', '/server/run', 'abc', 'gentai', 'nodes=node4:ppn=7', 1, batches)
+        with self.assertRaises(ValueError):
+            epoch.epoch_configs({}, 33, self.directory, (12, 16), -1)
+
     def fixture(self, batch, status='completed', skips=0, failures=None, code=0):
         folder = self.directory / ('batch_%03d/run' % batch)
         folder.mkdir(parents=True)
-        steps = 3 if batch == 16 else 2
+        steps = (33 + batch - 1) // batch
         state = dict(status=status, iteration=steps, completed_train_calls=steps - skips,
                      skipped_iterations=skips)
         (folder / 'run.json').write_text(json.dumps(state))
@@ -63,6 +84,17 @@ class EpochProbeTests(unittest.TestCase):
         code, rows = self.summarize()
         self.assertEqual(code, 0)
         self.assertEqual([row['status'] for row in rows], ['passed_one_train_pass_and_validation'] * 2)
+
+    def test_summary_uses_protocol_batches_instead_of_old_defaults(self):
+        for batch in (12, 16):
+            self.fixture(batch)
+        protocol = dict(train_size=33, batches=[12, 16], iterations={'12': 3, '16': 3})
+        (self.directory / 'protocol.json').write_text(json.dumps(protocol))
+        self.assertEqual(epoch.summarize(self.directory), 0)
+        report = json.loads((self.directory / 'summary.json').read_text())
+        self.assertEqual([row['batch_size'] for row in report['results']], [12, 16])
+        self.assertTrue(all(row['status'] == 'passed_one_train_pass_and_validation'
+                            for row in report['results']))
 
     def test_oom_in_first_candidate_does_not_hide_second_result(self):
         self.fixture(16, 'completed_with_skips', 1, [{'error': 'CUDA out of memory. Tried to allocate ...'}])
@@ -118,6 +150,22 @@ class EpochProbeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
         with self.assertRaises(ValueError):
             epoch.render_pbs('/repo', '/server/run', 'abc123', 'gentai\n#PBS bad', 'nodes=node1', 0)
+
+    def test_node4_pbs_selects_gpu_one_and_seven_cpus(self):
+        source = epoch.render_pbs('/server/MDRL', '/server/node4-run', 'abc123', 'gentai',
+                                  'nodes=node4:ppn=7,walltime=24:00:00', 1, (12, 16))
+        self.assertIn('#PBS -l nodes=node4:ppn=7,walltime=24:00:00', source)
+        self.assertIn('GPU=1\n', source)
+        self.assertIn('export CUDA_VISIBLE_DEVICES="$GPU"', source)
+        self.assertIn('--device cuda:0', source)
+        self.assertIn('for batch in 12 16; do', source)
+        self.assertNotIn('for batch in 16 24; do', source)
+        self.assertIn('OMP_NUM_THREADS=1 MKL_NUM_THREADS=1', source)
+        self.assertIn('OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1', source)
+        if BASH and Path(BASH).is_file():
+            result = subprocess.run([BASH, '--noprofile', '--norc', '-n'], input=source,
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == '__main__':

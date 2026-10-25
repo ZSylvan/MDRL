@@ -47,3 +47,30 @@ Passing means no recorded errors for one shuffled training pass and the original
 validation calls. It does not prove that later shuffle orders/batches, model
 states or competing workloads cannot OOM. This experiment never changes the
 running baseline's batch size or recommends doing so automatically.
+
+## Node4 RTX 4090: batches 12 and 16
+
+The generator also accepts `--batches 12 16 --num-workers 6`. Default calls
+still test batches 16 and 24 and retain the original worker count. Summaries
+read candidate sizes from each run's protocol, including older 16/24 runs.
+
+For node4, request `nodes=node4:ppn=7,walltime=24:00:00` and `--gpu 1`.
+The main training process uses six training DataLoader workers; the existing
+validation loader uses zero workers. OMP, MKL, OpenBLAS and NumExpr thread
+counts are limited to one. This is a seven-CPU request, not seven workers plus
+the trainer. Physical GPU 1 is exposed as logical `cuda:0` inside the job.
+Confirm that `gentai` permits node4 and follow the cluster's GPU allocation rules.
+
+Use an independent ID such as `mdrl-exp003-node4-b12-b16-<UTC timestamp>`.
+With 231523 effective training samples, batch 12 needs 19294 iterations and
+batch 16 needs 14471. Each candidate starts from scratch and performs the
+original validation calls, including final validation. Batch 16 is attempted
+even if batch 12 fails. Neither the running batch-8 pretraining job nor the
+completed node1 test directories are changed or reused.
+
+The existing MDRL environment is reused without installation. Its actual CUDA
+and compiled-extension compatibility with the RTX 4090 must be established by
+the server run; an architecture/kernel/import error is a compatibility failure,
+not proof of insufficient GPU memory. Preserve its logs rather than relabeling
+every failure as OOM. GPU availability is checked before each candidate; a
+busy GPU stops the launcher without terminating another process.
