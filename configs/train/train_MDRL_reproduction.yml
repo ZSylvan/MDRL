@@ -1,4 +1,4 @@
-# Original model, training hyperparameters and split; only input/output paths differ.
+# Original model and split; adapted input/output paths and batch size (24 -> 8).
 logdir: /home/zhuenqiang_1/Student_Project/zms/experiment_data/mdrl/pretrain
 
 model:
@@ -39,7 +39,7 @@ model:
 
 train:
   seed: 2023
-  batch_size: 24
+  batch_size: 8
   num_workers: 16
   pin_memory: True
   max_iters: 2_500_000

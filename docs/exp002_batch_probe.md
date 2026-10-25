@@ -24,8 +24,10 @@ training-molecule stress steps and 1 stress loss evaluation. The 600-second
 candidate limit and 80% memory limit are unchanged. Full protocol and output
 definitions remain in [experiment 001](exp001_batch_probe.md).
 
-The formal training YAML remains at batch 24. Any formal batch/LR/iteration
-change requires separate review after these measurements; no accumulation,
+At the time this probe was prepared, the formal training YAML remained at batch
+24. The user subsequently selected batch 8 for formal pretraining; see
+[current pretraining configuration and resume behavior](pretraining_reproduction.md).
+The probe candidates and historical measurements are unchanged; no accumulation,
 size filtering, reward changes or new random seeds are introduced.
 
 ## Local Checks And Synchronization

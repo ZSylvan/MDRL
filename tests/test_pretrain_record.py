@@ -185,7 +185,7 @@ class PretrainRecordTests(unittest.TestCase):
         self.assertEqual(best['iteration'], 1)
         self.assertEqual(last['iteration'], 2)
 
-    def run_simulated_loop(self, train, validate):
+    def run_simulated_loop(self, train, validate, start_iter=1, max_iters=3):
         # Execute the real loop with fake train/validate calls, not the MDRL model.
         tree = ast.parse((ROOT / 'scripts/train_drug3d.py').read_text(encoding='utf-8'))
         function = next(node for node in tree.body
@@ -198,11 +198,19 @@ class PretrainRecordTests(unittest.TestCase):
         optimizer.state_dict.return_value = {}
         with PretrainRecord(str(self.root), {}) as record:
             exec(code, {
-                'config': SimpleNamespace(train=SimpleNamespace(max_iters=3, val_freq=2)),
+                'config': SimpleNamespace(train=SimpleNamespace(max_iters=max_iters, val_freq=2)),
                 'model': model, 'optimizer': optimizer, 'scheduler': optimizer,
                 'scaler': optimizer, 'record': record, 'train': train,
                 'validate': validate, 'logger': Mock(),
+                'start_iter': start_iter, 'capture_rng_state': lambda: {},
             })
+
+    def test_resumed_loop_starts_at_next_iteration_and_keeps_total_target(self):
+        train = Mock()
+        validate = Mock(return_value={'loss': 1.0})
+        self.run_simulated_loop(train, validate, start_iter=4, max_iters=7)
+        self.assertEqual([call.args[0] for call in train.call_args_list], [4, 5, 6, 7])
+        self.assertEqual([call.args[0] for call in validate.call_args_list], [4, 6, 7])
 
     def test_loop_preserves_skip_and_validation_schedule(self):
         train = Mock(side_effect=[RuntimeError('skip iteration 1'), None, None])
@@ -243,6 +251,8 @@ class PretrainCompatibilityTests(unittest.TestCase):
         output_root = reproduction.pop('logdir')
         dataset_root = reproduction['dataset'].pop('root')
         original['dataset'].pop('root')
+        self.assertEqual(original['train'].pop('batch_size'), 24)
+        self.assertEqual(reproduction['train'].pop('batch_size'), 8)
         self.assertEqual(original, reproduction)
         self.assertEqual(dataset_root,
                          '/home/zhuenqiang_1/Student_Project/zms/raw_data/MDRL/geom_drug')
@@ -255,7 +265,8 @@ class PretrainCompatibilityTests(unittest.TestCase):
         self.assertLess(imports.index('distutils.version'), imports.index('torch.utils.tensorboard'))
         self.assertFalse(any(isinstance(node, ast.ImportFrom) and node.module == 'torchsummary'
                              for node in ast.walk(tree)))
-        for source in ('scripts/train_drug3d.py', 'utils/pretrain_record.py'):
+        for source in ('scripts/train_drug3d.py', 'utils/pretrain_record.py',
+                       'utils/pretrain_resume.py'):
             ast.parse((ROOT / source).read_text(encoding='utf-8'), feature_version=(3, 8))
 
 

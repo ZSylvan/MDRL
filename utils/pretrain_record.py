@@ -96,6 +96,39 @@ class PretrainRecord:
         })
         self._write_state()
 
+    def resume_from(self, checkpoint, source_path, best_path):
+        # A new segment owns only its new periodic files; never prune the parent.
+        self.state.update({
+            'iteration': checkpoint['iteration'],
+            'completed_train_calls': checkpoint['completed_train_calls'],
+            'skipped_iterations': checkpoint['skipped_iterations'],
+            'resume': {
+                'checkpoint': os.path.abspath(source_path),
+                'source_run_id': checkpoint['run_id'],
+                'iteration': checkpoint['iteration'],
+                'rng_state_available': checkpoint.get('rng_state') is not None,
+                'data_iterator_restored': False,
+            },
+        })
+        if checkpoint['best'] is not None:
+            if best_path is None:
+                raise ValueError('Historical best checkpoint is required')
+            best = dict(checkpoint['best'])
+            best.setdefault('run_id', checkpoint['run_id'])
+            best['checkpoint'] = 'checkpoints/best.pt'
+            self._copy_checkpoint(best_path, 'best.pt')
+            self.state['best'] = best
+        self._copy_checkpoint(source_path, 'last.pt')
+        self.state['last_checkpoint'] = {
+            'iteration': checkpoint['iteration'], 'checkpoint': 'checkpoints/last.pt',
+        }
+        self._write_state()
+
+    def _copy_checkpoint(self, source, name):
+        alias = os.path.join(self.log_dir, 'checkpoints', name)
+        shutil.copyfile(source, alias + '.tmp')
+        os.replace(alias + '.tmp', alias)
+
     def save_checkpoint(self, checkpoint, losses):
         iteration = checkpoint['iteration']
         loss = float(losses['loss'])
@@ -106,6 +139,7 @@ class PretrainRecord:
             best = {
                 'iteration': iteration, 'loss': loss,
                 'checkpoint': 'checkpoints/best.pt', 'source_checkpoint': relative_path,
+                'run_id': self.state['run_id'],
             }
         payload = dict(checkpoint)
         payload.update({
@@ -131,9 +165,7 @@ class PretrainRecord:
         retained.append(relative_path)
         # Best/last copies remain independent of periodic file retention.
         for name in (['last.pt', 'best.pt'] if improved else ['last.pt']):
-            alias = os.path.join(self.log_dir, 'checkpoints', name)
-            shutil.copyfile(path, alias + '.tmp')
-            os.replace(alias + '.tmp', alias)
+            self._copy_checkpoint(path, name)
             if name == 'last.pt':
                 self.state['last_checkpoint'] = {'iteration': iteration, 'checkpoint': relative_path}
             else:

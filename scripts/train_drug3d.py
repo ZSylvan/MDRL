@@ -18,10 +18,12 @@ from utils.transforms import FeaturizeMol, Compose
 from utils.misc import *
 from utils.train import *
 from utils.pretrain_record import PretrainRecord, git_version
+from utils.pretrain_resume import (capture_rng_state, find_resume_best,
+                                   load_resume_checkpoint, restore_training_state)
 
 
 
-def run_training(args, config, logger, writer, record):
+def run_training(args, config, logger, writer, record, resume_checkpoint=None):
     # Transforms
     featurizer = FeaturizeMol(config.chem.atomic_numbers, config.chem.mol_bond_types,
                             use_mask_node=config.transform.use_mask_node,
@@ -66,6 +68,15 @@ def run_training(args, config, logger, writer, record):
     optimizer = get_optimizer(config.train.optimizer, model)
     scheduler = get_scheduler(config.train.scheduler, optimizer)
     scaler = torch.cuda.amp.GradScaler(enabled=config.train.use_amp)
+    start_iter = 1
+    if resume_checkpoint is not None:
+        start_iter = restore_training_state(resume_checkpoint, model, optimizer, scheduler, scaler)
+        logger.info('Resuming after iteration %d; total target %d',
+                    start_iter - 1, config.train.max_iters)
+        logger.warning('DataLoader shuffle/prefetch position is not restored; '
+                       'resume is not bitwise equivalent to uninterrupted training')
+        if resume_checkpoint.get('rng_state') is None:
+            logger.warning('Legacy checkpoint has no RNG state; using seeded process state')
 
     def train(it):
         optimizer.zero_grad(set_to_none=True)
@@ -146,7 +157,7 @@ def run_training(args, config, logger, writer, record):
         return avg_loss_dict
 
     model.train()
-    for it in range(1, config.train.max_iters+1):
+    for it in range(start_iter, config.train.max_iters+1):
         record.state['iteration'] = it
         record.state['phase'] = 'train'
         try:
@@ -167,6 +178,7 @@ def run_training(args, config, logger, writer, record):
                 'scheduler': scheduler.state_dict(),
                 'scaler': scaler.state_dict(),
                 'iteration': it,
+                'rng_state': capture_rng_state(),
             }, validation_losses)
             if improved:
                 logger.info('Best checkpoint: iteration %d, validation loss %.6f',
@@ -194,6 +206,8 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str, default='configs/train/train_MDRL.yml')
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--logdir', type=str, default=None)
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Trusted complete checkpoint; continue in a new output directory')
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -217,9 +231,15 @@ if __name__ == '__main__':
     }
     try:
         with PretrainRecord(log_dir, metadata) as record:
+            resume_checkpoint = None
+            if args.resume is not None:
+                record.state['phase'] = 'resume'
+                resume_checkpoint = load_resume_checkpoint(args.resume, config)
+                best_path = find_resume_best(args.resume, resume_checkpoint)
+                record.resume_from(resume_checkpoint, args.resume, best_path)
             writer = torch.utils.tensorboard.SummaryWriter(log_dir)
             try:
-                run_training(args, config, logger, writer, record)
+                run_training(args, config, logger, writer, record, resume_checkpoint)
             finally:
                 writer.close()
     except KeyboardInterrupt:
