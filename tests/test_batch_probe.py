@@ -15,6 +15,7 @@ from scripts.prepare_batch_probe_pbs import render_pbs
 
 
 EXPERIMENT = probe.ROOT / 'configs/experiments/exp001_batch_probe.yml'
+SMALL_EXPERIMENT = probe.ROOT / 'configs/experiments/exp002_batch_probe.yml'
 GIT = shutil.which('git')
 BASH = (str(Path(GIT).parent.parent / 'bin/bash.exe') if os.name == 'nt' and GIT
         else shutil.which('bash'))
@@ -48,6 +49,34 @@ class BatchProbeTests(unittest.TestCase):
         self.assertEqual(experiment['measured_steps'], 20)
         self.assertLessEqual(sum(experiment[key] for key in
                                  ('warmup_steps', 'measured_steps', 'stress_steps')), 30)
+
+    def test_small_probe_only_changes_experiment_id_and_candidates(self):
+        original = probe.load_experiment(EXPERIMENT)
+        small = probe.load_experiment(SMALL_EXPERIMENT)
+        self.assertEqual(small['id'], 'mdrl-exp002-batch-capacity')
+        self.assertEqual(small['batch_sizes'], [2, 4, 6])
+        self.assertEqual(original['batch_sizes'], [8, 16, 24, 32, 48, 64, 96, 128])
+        excluded = {'id', 'batch_sizes'}
+        self.assertEqual({key: value for key, value in original.items() if key not in excluded},
+                         {key: value for key, value in small.items() if key not in excluded})
+
+    def test_small_probe_uses_separate_run_and_preserves_first_probe(self):
+        first_output = self.root / 'exp001/results'
+        small_output = self.root / 'exp002/results'
+        with patch.object(probe, 'launch_worker', side_effect=self.fake_worker({16: 'oom'})):
+            probe.run_experiment(EXPERIMENT, first_output)
+        first_summary = (first_output / 'summary.json').read_bytes()
+        with patch.object(probe, 'launch_worker', side_effect=self.fake_worker({})) as launch:
+            self.assertEqual(probe.run_experiment(SMALL_EXPERIMENT, small_output), 0)
+        self.assertEqual(launch.call_count, 3)
+        summary = json.loads((small_output / 'summary.json').read_text(encoding='utf-8'))
+        self.assertEqual(summary['experiment_id'], 'mdrl-exp002-batch-capacity')
+        self.assertEqual([row['batch_size'] for row in summary['results']], [2, 4, 6])
+        self.assertEqual(summary['recommended_batch_size'], 6)
+        self.assertEqual(summary['status'], 'completed_grid')
+        self.assertEqual(summary['untested_batch_sizes'], [])
+        self.assertEqual((small_output / 'experiment.yml').read_bytes(), SMALL_EXPERIMENT.read_bytes())
+        self.assertEqual((first_output / 'summary.json').read_bytes(), first_summary)
 
     def test_missing_input_is_rejected_without_loading_or_processing_data(self):
         dataset_config = SimpleNamespace(root=str(self.root), split='split.pt',
@@ -181,6 +210,14 @@ class BatchProbePBSTests(unittest.TestCase):
             render_pbs('/repo', '/config', '/runs/test', 'gentai\n#PBS bad', 'nodes=node1')
         with self.assertRaises(ValueError):
             render_pbs('/repo', '/config', '/runs/test', 'gentai', 'nodes=node1\necho bad')
+
+    def test_independent_job_name_does_not_change_execution(self):
+        original = self.render(gpu=1)
+        small = self.render(gpu=1, job_name='mdrl-batch002')
+        self.assertEqual(small, original.replace('#PBS -N mdrl-batch001', '#PBS -N mdrl-batch002'))
+        for name in ('bad\n#PBS bad', '123invalid', 'x' * 16):
+            with self.subTest(job_name=name), self.assertRaises(ValueError):
+                self.render(job_name=name)
 
     @unittest.skipUnless(BASH and Path(BASH).is_file(), 'Bash not available')
     def test_generated_pbs_shell_syntax(self):

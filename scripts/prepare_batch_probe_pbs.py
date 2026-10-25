@@ -1,4 +1,4 @@
-"""Prepare, but never submit, the first MDRL capacity experiment."""
+"""Prepare, but never submit, an MDRL capacity experiment."""
 
 import argparse
 import re
@@ -16,7 +16,10 @@ from scripts.probe_pretrain_batch import load_experiment
 PYTHON = '/home/zhuenqiang_1/.conda/envs/MDRL/bin/python'
 
 
-def render_pbs(repo, experiment, job_dir, queue, resources, gpu=None, python=PYTHON):
+def render_pbs(repo, experiment, job_dir, queue, resources, gpu=None, python=PYTHON,
+               job_name='mdrl-batch001'):
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,14}', job_name):
+        raise ValueError('PBS job name must start with a letter and use at most 15 safe characters')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', queue):
         raise ValueError('Invalid PBS queue')
     if not re.fullmatch(r'[A-Za-z0-9_.,:=+-]+', resources):
@@ -32,7 +35,7 @@ def render_pbs(repo, experiment, job_dir, queue, resources, gpu=None, python=PYT
         '    echo "ERROR: no scheduler GPU mask; authorize explicit selection with --gpu" >&2\n'
         '    exit 2')
     return '\n'.join([
-        '#!/bin/bash', '#PBS -N mdrl-batch001', '#PBS -q ' + queue,
+        '#!/bin/bash', '#PBS -N ' + job_name, '#PBS -q ' + queue,
         '#PBS -l ' + resources, '#PBS -j oe', '#PBS -o ' + str(job_dir / 'pbs.out'),
         '', 'set -euo pipefail',
         'DIRECT_LOG=' + quote(str(job_dir / 'launcher.log')),
@@ -62,6 +65,7 @@ def main():
     parser.add_argument('--queue', required=True)
     parser.add_argument('--resources', required=True, help='Exact PBS -l request approved for this cluster')
     parser.add_argument('--gpu', type=int, help='Physical GPU only if manual selection is permitted; preserves scheduler mask')
+    parser.add_argument('--job-name', default='mdrl-batch001', help='PBS job label, at most 15 characters')
     parser.add_argument('--run-id', default='mdrl-exp001-batch-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'))
     args = parser.parse_args()
     if sys.platform != 'linux':
@@ -70,7 +74,8 @@ def main():
         parser.error('run-id must be a simple directory name')
     config = load_experiment(args.experiment)
     job_dir = Path(config['output_root']) / args.run_id
-    source = render_pbs(ROOT, args.experiment.resolve(), job_dir, args.queue, args.resources, args.gpu)
+    source = render_pbs(ROOT, args.experiment.resolve(), job_dir, args.queue, args.resources, args.gpu,
+                        job_name=args.job_name)
     job_dir.mkdir(parents=True, exist_ok=False)
     path = job_dir / 'job.pbs'
     with path.open('x', encoding='utf-8', newline='\n') as handle:
