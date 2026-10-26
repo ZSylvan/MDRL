@@ -185,7 +185,46 @@ class PretrainRecordTests(unittest.TestCase):
         self.assertEqual(best['iteration'], 1)
         self.assertEqual(last['iteration'], 2)
 
-    def run_simulated_loop(self, train, validate, start_iter=1, max_iters=3):
+    def test_recovery_only_updates_last_without_validation_or_new_periodic_file(self):
+        with PretrainRecord(str(self.root), {}) as record:
+            record.save_checkpoint(self.checkpoint(1), {'loss': 1.0})
+            before_best = (self.root / 'checkpoints/best.pt').read_bytes()
+            self.assertFalse(record.save_checkpoint(self.checkpoint(2), keep_periodic=False))
+            self.assertEqual((self.root / 'checkpoints/best.pt').read_bytes(), before_best)
+            last = torch.load(self.root / 'checkpoints/last.pt', map_location='cpu')
+            self.assertEqual(last['iteration'], 2)
+            self.assertIsNone(last['validation_losses'])
+            self.assertEqual(last['best']['iteration'], 1)
+            self.assertEqual(last['checkpoint_kind'], 'recovery')
+            self.assertEqual(record.state['last_checkpoint']['checkpoint'], 'checkpoints/last.pt')
+            self.assertFalse((self.root / 'checkpoints/2.pt').exists())
+            self.assertEqual(len(self.read_events('validation.jsonl')), 1)
+            self.assertEqual([event['kind'] for event in self.read_events('checkpoints.jsonl')],
+                             ['validation', 'recovery'])
+
+    def test_recovery_write_failure_keeps_previous_last(self):
+        with self.assertRaises(OSError):
+            with PretrainRecord(str(self.root), {}) as record:
+                record.save_checkpoint(self.checkpoint(1), {'loss': 1.0})
+                with patch('utils.pretrain_record.torch.save', side_effect=OSError('full disk')):
+                    record.save_checkpoint(self.checkpoint(2), keep_periodic=False)
+        last = torch.load(self.root / 'checkpoints/last.pt', map_location='cpu')
+        self.assertEqual(last['iteration'], 1)
+
+    def test_fifty_total_files_protect_pinned_milestones_when_rotating(self):
+        with PretrainRecord(str(self.root), {}, periodic_checkpoint_limit=48,
+                            pinned_iterations=(1, 2)) as record:
+            for it in range(1, 56):
+                record.save_checkpoint(self.checkpoint(it), {'loss': float(it)})
+                self.assertLessEqual(len(list((self.root / 'checkpoints').glob('*.pt'))), 50)
+        self.assertTrue((self.root / 'checkpoints/1.pt').is_file())
+        self.assertTrue((self.root / 'checkpoints/2.pt').is_file())
+        self.assertFalse((self.root / 'checkpoints/3.pt').exists())
+        self.assertEqual(len(list((self.root / 'checkpoints').glob('*.pt'))), 50)
+        self.assertEqual(self.read_json('run.json')['pinned_iterations'], [1, 2])
+
+    def run_simulated_loop(self, train, validate, start_iter=1, max_iters=3,
+                           val_freq=2, checkpoint_freq=0, checkpoint_milestones=()):
         # Execute the real loop with fake train/validate calls, not the MDRL model.
         tree = ast.parse((ROOT / 'scripts/train_drug3d.py').read_text(encoding='utf-8'))
         function = next(node for node in tree.body
@@ -196,14 +235,36 @@ class PretrainRecordTests(unittest.TestCase):
         model.state_dict.return_value = {}
         optimizer = Mock()
         optimizer.state_dict.return_value = {}
-        with PretrainRecord(str(self.root), {}) as record:
+        with PretrainRecord(str(self.root), {}, pinned_iterations=checkpoint_milestones) as record:
             exec(code, {
-                'config': SimpleNamespace(train=SimpleNamespace(max_iters=max_iters, val_freq=2)),
+                'config': SimpleNamespace(train=SimpleNamespace(max_iters=max_iters, val_freq=val_freq)),
                 'model': model, 'optimizer': optimizer, 'scheduler': optimizer,
                 'scaler': optimizer, 'record': record, 'train': train,
                 'validate': validate, 'logger': Mock(),
                 'start_iter': start_iter, 'capture_rng_state': lambda: {},
+                'snapshot': self.checkpoint, 'checkpoint_freq': checkpoint_freq,
+                'checkpoint_milestones': set(checkpoint_milestones),
             })
+
+    def test_sparse_validation_recovery_and_milestones_have_independent_schedules(self):
+        validate = Mock(side_effect=[{'loss': 1.0}, {'loss': 2.0}])
+        self.run_simulated_loop(Mock(), validate, max_iters=9, val_freq=6,
+                                checkpoint_freq=2, checkpoint_milestones=(5, 9))
+        self.assertEqual([call.args[0] for call in validate.call_args_list], [6, 9])
+        self.assertEqual([event['iteration'] for event in self.read_events('checkpoints.jsonl')],
+                         [2, 4, 5, 6, 8, 9])
+        self.assertEqual([event['iteration'] for event in self.read_events('validation.jsonl')], [6, 9])
+        self.assertEqual({path.stem for path in (self.root / 'checkpoints').glob('*.pt')},
+                         {'5', '6', '9', 'best', 'last'})
+        self.assertEqual(self.read_json('run.json')['best']['iteration'], 6)
+
+    def test_resumed_sparse_loop_keeps_global_iteration_cadence(self):
+        validate = Mock(return_value={'loss': 1.0})
+        self.run_simulated_loop(Mock(), validate, start_iter=7, max_iters=13, val_freq=6,
+                                checkpoint_freq=2, checkpoint_milestones=(9, 13))
+        self.assertEqual([call.args[0] for call in validate.call_args_list], [12, 13])
+        self.assertEqual([event['iteration'] for event in self.read_events('checkpoints.jsonl')],
+                         [8, 9, 10, 12, 13])
 
     def test_resumed_loop_starts_at_next_iteration_and_keeps_total_target(self):
         train = Mock()

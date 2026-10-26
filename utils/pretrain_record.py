@@ -31,7 +31,13 @@ def _now():
 
 
 class PretrainRecord:
-    def __init__(self, log_dir, metadata):
+    def __init__(self, log_dir, metadata, periodic_checkpoint_limit=MAX_PERIODIC_CHECKPOINTS,
+                 pinned_iterations=()):
+        pinned_iterations = sorted(set(pinned_iterations))
+        if (type(periodic_checkpoint_limit) is not int or periodic_checkpoint_limit < 1 or
+                any(type(it) is not int or it <= 0 for it in pinned_iterations) or
+                len(pinned_iterations) >= periodic_checkpoint_limit):
+            raise ValueError('Checkpoint capacity must leave room beyond the pinned iterations')
         self.log_dir = log_dir
         self.state = {
             'run_id': os.path.basename(os.path.abspath(log_dir)),
@@ -45,11 +51,13 @@ class PretrainRecord:
             'best': None,
             'last_checkpoint': None,
             'selection_rule': SELECTION_RULE,
-            'periodic_checkpoint_limit': MAX_PERIODIC_CHECKPOINTS,
+            'periodic_checkpoint_limit': periodic_checkpoint_limit,
+            'max_checkpoint_files': periodic_checkpoint_limit + 2,
+            'pinned_iterations': pinned_iterations,
             'periodic_checkpoints': [],
             'metadata': metadata,
         }
-        for name in ('validation.jsonl', 'failures.jsonl'):
+        for name in ('validation.jsonl', 'failures.jsonl', 'checkpoints.jsonl'):
             with open(os.path.join(log_dir, name), 'x', encoding='utf-8'):
                 pass
         self._write_state()
@@ -129,12 +137,14 @@ class PretrainRecord:
         shutil.copyfile(source, alias + '.tmp')
         os.replace(alias + '.tmp', alias)
 
-    def save_checkpoint(self, checkpoint, losses):
+    def save_checkpoint(self, checkpoint, losses=None, keep_periodic=True):
+        if losses is not None and not keep_periodic:
+            raise ValueError('Validation checkpoints must retain their numbered file')
         iteration = checkpoint['iteration']
-        loss = float(losses['loss'])
+        loss = float(losses['loss']) if losses is not None else float('nan')
         best = self.state['best']
         improved = math.isfinite(loss) and (best is None or loss < best['loss'])
-        relative_path = 'checkpoints/%d.pt' % iteration
+        relative_path = ('checkpoints/%d.pt' % iteration if keep_periodic else 'checkpoints/last.pt')
         if improved:
             best = {
                 'iteration': iteration, 'loss': loss,
@@ -148,37 +158,50 @@ class PretrainRecord:
             'completed_train_calls': self.state['completed_train_calls'],
             'skipped_iterations': self.state['skipped_iterations'],
             'selection_rule': SELECTION_RULE,
-            'periodic_checkpoint_limit': MAX_PERIODIC_CHECKPOINTS,
+            'periodic_checkpoint_limit': self.state['periodic_checkpoint_limit'],
+            'pinned_iterations': self.state['pinned_iterations'],
+            'checkpoint_kind': ('validation' if losses is not None else
+                                'milestone' if keep_periodic else 'recovery'),
             'best': best,
         })
         path = os.path.join(self.log_dir, relative_path)
         torch.save(payload, path + '.tmp')
-        # Stage the new file fully before retiring an owned periodic checkpoint.
-        # Free its slot before rename, so at most 50 periodic .pt files exist.
+        # Stage fully before retiring an owned, unpinned periodic checkpoint.
         pruned = []
         retained = self.state['periodic_checkpoints']
-        if len(retained) == MAX_PERIODIC_CHECKPOINTS:
-            oldest = retained[0]
+        if keep_periodic and len(retained) == self.state['periodic_checkpoint_limit']:
+            oldest = next(path for path in retained
+                          if int(os.path.basename(path).split('.')[0]) not in self.state['pinned_iterations'])
             os.remove(os.path.join(self.log_dir, oldest))
-            pruned.append(retained.pop(0))
+            retained.remove(oldest)
+            pruned.append(oldest)
         os.replace(path + '.tmp', path)
-        retained.append(relative_path)
+        if keep_periodic:
+            retained.append(relative_path)
         # Best/last copies remain independent of periodic file retention.
-        for name in (['last.pt', 'best.pt'] if improved else ['last.pt']):
+        aliases = ['last.pt', 'best.pt'] if improved else ['last.pt']
+        for name in (aliases if keep_periodic else []):
             self._copy_checkpoint(path, name)
             if name == 'last.pt':
                 self.state['last_checkpoint'] = {'iteration': iteration, 'checkpoint': relative_path}
             else:
                 self.state['best'] = best
-        self._append('validation.jsonl', {
-            'time': _now(), 'iteration': iteration,
-            'losses': {key: float(value) if math.isfinite(value) else None
-                       for key, value in losses.items()},
-            'nonfinite_metrics': [key for key, value in losses.items() if not math.isfinite(value)],
-            'is_best': improved, 'checkpoint': relative_path,
-            'pruned_checkpoints': pruned,
-            'completed_train_calls': self.state['completed_train_calls'],
-            'skipped_iterations': self.state['skipped_iterations'],
+        if not keep_periodic:
+            self.state['last_checkpoint'] = {'iteration': iteration, 'checkpoint': relative_path}
+        self._append('checkpoints.jsonl', {
+            'time': _now(), 'iteration': iteration, 'kind': payload['checkpoint_kind'],
+            'checkpoint': relative_path, 'pruned_checkpoints': pruned,
         })
+        if losses is not None:
+            self._append('validation.jsonl', {
+                'time': _now(), 'iteration': iteration,
+                'losses': {key: float(value) if math.isfinite(value) else None
+                           for key, value in losses.items()},
+                'nonfinite_metrics': [key for key, value in losses.items() if not math.isfinite(value)],
+                'is_best': improved, 'checkpoint': relative_path,
+                'pruned_checkpoints': pruned,
+                'completed_train_calls': self.state['completed_train_calls'],
+                'skipped_iterations': self.state['skipped_iterations'],
+            })
         self._write_state()
         return improved

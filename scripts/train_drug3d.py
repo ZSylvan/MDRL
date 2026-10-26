@@ -40,6 +40,18 @@ def run_training(args, config, logger, writer, record, resume_checkpoint=None):
         transform = transform,
     )
     train_set, val_set = subsets['train'], subsets['val']
+    steps_per_epoch = (len(train_set) + config.train.batch_size - 1) // config.train.batch_size
+    val_every_epochs = config.train.get('val_every_epochs')
+    if val_every_epochs is not None and config.train.val_freq != steps_per_epoch * val_every_epochs:
+        raise ValueError('val_freq does not match the effective training split and val_every_epochs')
+    checkpoint_freq = config.train.get('checkpoint_freq', 0)
+    checkpoint_milestones = set(config.train.get('checkpoint_milestones', []))
+    record.state['schedule'] = {
+        'train_size': len(train_set), 'steps_per_epoch': steps_per_epoch,
+        'val_freq': config.train.val_freq, 'val_every_epochs': val_every_epochs,
+        'checkpoint_freq': checkpoint_freq, 'checkpoint_milestones': sorted(checkpoint_milestones),
+    }
+    logger.info('Training schedule: %s', record.state['schedule'])
     train_iterator = inf_iterator(DataLoader(
         train_set, 
         batch_size = config.train.batch_size, 
@@ -156,6 +168,14 @@ def run_training(args, config, logger, writer, record, resume_checkpoint=None):
         writer.flush()
         return avg_loss_dict
 
+    def snapshot(it):
+        return {
+            'config': config, 'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
+            'scaler': scaler.state_dict(), 'iteration': it,
+            'rng_state': capture_rng_state(),
+        }
+
     model.train()
     for it in range(start_iter, config.train.max_iters+1):
         record.state['iteration'] = it
@@ -171,19 +191,16 @@ def run_training(args, config, logger, writer, record, resume_checkpoint=None):
             record.state['phase'] = 'validation'
             validation_losses = validate(it)
             record.state['phase'] = 'checkpoint'
-            improved = record.save_checkpoint({
-                'config': config,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'scaler': scaler.state_dict(),
-                'iteration': it,
-                'rng_state': capture_rng_state(),
-            }, validation_losses)
+            improved = record.save_checkpoint(snapshot(it), validation_losses)
             if improved:
                 logger.info('Best checkpoint: iteration %d, validation loss %.6f',
                             it, validation_losses['loss'])
             model.train()
+        elif it in checkpoint_milestones or (checkpoint_freq and it % checkpoint_freq == 0):
+            record.state['phase'] = 'checkpoint'
+            record.save_checkpoint(snapshot(it), keep_periodic=it in checkpoint_milestones)
+            logger.info('Saved %s checkpoint at iteration %d without validation',
+                        'milestone' if it in checkpoint_milestones else 'recovery last', it)
 
     # model.train()
     # for it in range(1, config.train.max_iters+1):
@@ -230,7 +247,10 @@ if __name__ == '__main__':
         'torch': torch.__version__,
     }
     try:
-        with PretrainRecord(log_dir, metadata) as record:
+        with PretrainRecord(
+                log_dir, metadata,
+                periodic_checkpoint_limit=config.train.get('max_checkpoint_files', 52) - 2,
+                pinned_iterations=config.train.get('checkpoint_milestones', [])) as record:
             resume_checkpoint = None
             if args.resume is not None:
                 record.state['phase'] = 'resume'

@@ -76,7 +76,7 @@ def find_resume_best(path, checkpoint):
         saved = checkpoint if os.path.abspath(candidate) == os.path.abspath(path) else load_checkpoint(candidate)
         if (saved.get('iteration') == best['iteration'] and
                 saved.get('run_id') == expected_run and
-                saved.get('validation_losses', {}).get('loss') == best['loss']):
+                (saved.get('validation_losses') or {}).get('loss') == best['loss']):
             return os.path.abspath(candidate)
     raise ValueError('Matching historical best checkpoint is missing; preserve the source '
                      'best.pt (or its periodic file). Refusing to reset best selection')

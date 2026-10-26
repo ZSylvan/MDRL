@@ -207,6 +207,37 @@ class PretrainResumeTests(unittest.TestCase):
                              ('scheduler', scheduler), ('scaler', scaler)):
             target.load_state_dict.assert_called_once_with(checkpoint[name])
 
+    def test_recovery_checkpoint_resumes_before_first_validation(self):
+        with PretrainRecord(str(self.source), {}) as record:
+            record.state.update(iteration=5, completed_train_calls=5)
+            record.save_checkpoint(self.checkpoint(5), keep_periodic=False)
+        path = self.source / 'checkpoints/last.pt'
+        checkpoint = load_resume_checkpoint(path, self.config)
+        self.assertIsNone(checkpoint['best'])
+        self.assertIsNone(find_resume_best(path, checkpoint))
+        child = self.new_run('child')
+        with PretrainRecord(str(child), {}) as record:
+            record.resume_from(checkpoint, path, None)
+            self.assertEqual(record.state['completed_train_calls'], 5)
+            self.assertEqual(load_checkpoint(child / 'checkpoints/last.pt')['iteration'], 5)
+
+    def test_recovery_and_milestone_checkpoints_keep_historical_best(self):
+        with PretrainRecord(str(self.source), {}, pinned_iterations=(6,)) as record:
+            record.save_checkpoint(self.checkpoint(5), {'loss': 1.0})
+            record.state.update(iteration=6, completed_train_calls=6)
+            record.save_checkpoint(self.checkpoint(6))
+            self.assertEqual(record.state['best']['iteration'], 5)
+            record.state.update(iteration=8, completed_train_calls=8)
+            record.save_checkpoint(self.checkpoint(8), keep_periodic=False)
+        path = self.source / 'checkpoints/last.pt'
+        checkpoint = load_resume_checkpoint(path, self.config)
+        best_path = find_resume_best(path, checkpoint)
+        self.assertEqual(load_checkpoint(best_path)['iteration'], 5)
+        self.assertEqual(checkpoint['completed_train_calls'], 8)
+        self.assertTrue((self.source / 'checkpoints/6.pt').is_file())
+        model, optimizer, scheduler, scaler = [Mock() for _ in range(4)]
+        self.assertEqual(restore_training_state(checkpoint, model, optimizer, scheduler, scaler), 9)
+
     def test_cuda_rng_device_count_mismatch_fails_clearly(self):
         with patch('torch.cuda.is_available', return_value=False):
             checkpoint = dict(self.checkpoint(5), rng_state=capture_rng_state())
