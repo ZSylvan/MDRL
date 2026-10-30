@@ -149,6 +149,39 @@ class PretrainResumeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'selection rule'):
             load_resume_checkpoint(self.root / 'incomplete.pt', self.config)
 
+    def test_nonfinite_model_optimizer_and_amp_state_are_rejected(self):
+        original = load_checkpoint(self.save_parent())
+        cases = (
+            ('model', {'weight': torch.tensor([float('nan')])}),
+            ('optimizer', {'state': {0: {'exp_avg': torch.tensor([float('inf')])}}}),
+            ('scaler', {'scale': float('nan')}),
+            ('scaler', {'scale': 0.0}),
+        )
+        config = copy.deepcopy(self.config)
+        config['train']['use_amp'] = True
+        for section, values in cases:
+            checkpoint = copy.deepcopy(original)
+            checkpoint['config'] = config
+            checkpoint['scaler'] = {'scale': 64.0}
+            checkpoint[section] = values
+            path = self.root / 'bad.pt'
+            torch.save(checkpoint, path)
+            with self.subTest(section=section, values=values), self.assertRaises(ValueError):
+                load_resume_checkpoint(path, config)
+
+    def test_scheduler_infinity_sentinel_is_not_treated_as_corruption(self):
+        checkpoint = load_checkpoint(self.save_parent())
+        checkpoint['scheduler'] = {'mode_worse': float('inf'), 'best': float('inf')}
+        path = self.root / 'sentinel.pt'
+        torch.save(checkpoint, path)
+        self.assertEqual(load_resume_checkpoint(path, self.config)['iteration'], 10)
+
+    def test_failure_snapshot_cannot_be_used_for_resume(self):
+        path = self.root / 'diagnostic.pt'
+        torch.save({'diagnostic_only': True, 'iteration': 11}, path)
+        with self.assertRaisesRegex(ValueError, 'diagnostic only'):
+            load_resume_checkpoint(path, self.config)
+
     def test_full_state_and_rng_roundtrip_with_cpu_toy_model(self):
         model = torch.nn.Linear(2, 1)
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)

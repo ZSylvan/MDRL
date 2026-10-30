@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from utils.pretrain_record import SELECTION_RULE
+from utils.pretrain_checks import validate_resume_numerics
 
 
 def load_checkpoint(path):
@@ -23,6 +24,8 @@ def load_checkpoint(path):
 
 def load_resume_checkpoint(path, config):
     checkpoint = load_checkpoint(path)
+    if isinstance(checkpoint, dict) and checkpoint.get('diagnostic_only'):
+        raise ValueError('Failure snapshots are diagnostic only, not resumable checkpoints')
     required = {'config', 'model', 'optimizer', 'scheduler', 'scaler', 'iteration',
                 'run_id', 'best', 'selection_rule', 'completed_train_calls',
                 'skipped_iterations'}
@@ -51,6 +54,7 @@ def load_resume_checkpoint(path, config):
     if saved != current:
         raise ValueError('Resume configuration differs; only dataset root, logdir and '
                          'total max_iters may change (batch size must match)')
+    validate_resume_numerics(checkpoint)
     return checkpoint
 
 

@@ -80,11 +80,25 @@ class Node5PretrainTests(unittest.TestCase):
         self.assertIn('"$(hostname -s)" == node5', source)
         self.assertIn('--device cuda:0', source)
         self.assertIn('--query-compute-apps=pid', source)
+        self.assertIn('ALLOW_SHARED_GPU=0', source)
         self.assertIn('repository changed after preparation', source)
         self.assertIn('set -o noclobber', source)
         self.assertIn('OPENBLAS_NUM_THREADS=1', source)
         self.assertNotIn('qsub', source)
         self.assertNotIn('--resume', source)
+        if BASH and Path(BASH).is_file():
+            checked = subprocess.run([BASH, '--noprofile', '--norc', '-n'], input=source,
+                                     text=True, capture_output=True)
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_gpu_sharing_requires_explicit_opt_in_and_logs_existing_occupancy(self):
+        source = job.render_pbs('/server/repo', '/server/run', 'abc', 'gentai',
+                                'nodes=node5:ppn=15', allow_shared_gpu=True)
+        self.assertIn('ALLOW_SHARED_GPU=1', source)
+        self.assertIn('if [[ "$ALLOW_SHARED_GPU" != 1 ]]', source)
+        self.assertIn('GPU sharing explicitly allowed; existing compute PIDs:', source)
+        self.assertIn('nvidia-smi -i 0', source)
+        self.assertNotIn('kill ', source)
         if BASH and Path(BASH).is_file():
             checked = subprocess.run([BASH, '--noprofile', '--norc', '-n'], input=source,
                                      text=True, capture_output=True)
@@ -106,7 +120,8 @@ class Node5PretrainTests(unittest.TestCase):
 
     def test_python38_syntax(self):
         for relative in ('scripts/prepare_pretrain_pbs.py', 'utils/pretrain_record.py',
-                         'scripts/train_drug3d.py', 'utils/pretrain_resume.py'):
+                         'scripts/train_drug3d.py', 'utils/pretrain_resume.py',
+                         'utils/pretrain_checks.py'):
             ast.parse((ROOT / relative).read_text(), feature_version=(3, 8))
 
     def test_linux_generator_writes_effective_config_and_refuses_reusing_run_id(self):
@@ -133,7 +148,8 @@ class Node5PretrainTests(unittest.TestCase):
             # The PBS output path is POSIX even when these file tests run on Windows.
             with patch.object(job, 'ROOT', repo), patch.object(job, 'OUTPUT_ROOT', str(output)), \
                     patch.object(job.sys, 'platform', 'linux'), \
-                    patch.object(job.sys, 'argv', ['prepare_pretrain_pbs.py', '--run-id', 'fresh']), \
+                    patch.object(job.sys, 'argv', ['prepare_pretrain_pbs.py', '--run-id', 'fresh',
+                                                   '--allow-shared-gpu']), \
                     patch.object(job, 'git_version', return_value={'commit': 'abc', 'dirty': False}), \
                     patch.object(job, 'render_pbs', return_value='#!/bin/bash\n'), \
                     patch.dict('sys.modules', {'easydict': SimpleNamespace(EasyDict=attributes)}):
@@ -147,6 +163,7 @@ class Node5PretrainTests(unittest.TestCase):
                 self.assertEqual(protocol['validation_iterations'], [10, 20, 24])
                 self.assertEqual(protocol['planned_named_checkpoint_iterations'], [10, 16, 20, 24])
                 self.assertEqual(protocol['planned_files_without_resume'], 6)
+                self.assertTrue(protocol['allow_shared_gpu'])
                 before = {path.name: path.read_bytes() for path in run.iterdir()}
                 with self.assertRaises(FileExistsError):
                     job.main()

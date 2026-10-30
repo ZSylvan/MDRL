@@ -10,6 +10,7 @@ import torch
 import yaml
 
 from utils.pretrain_record import MAX_PERIODIC_CHECKPOINTS, PretrainRecord, SELECTION_RULE
+from utils.pretrain_checks import NonfiniteTrainingError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -233,6 +234,7 @@ class PretrainRecordTests(unittest.TestCase):
         code = compile(ast.Module(body=[loop], type_ignores=[]), '<pretraining loop>', 'exec')
         model = Mock()
         model.state_dict.return_value = {}
+        model.named_parameters.return_value = []
         optimizer = Mock()
         optimizer.state_dict.return_value = {}
         with PretrainRecord(str(self.root), {}, pinned_iterations=checkpoint_milestones) as record:
@@ -244,6 +246,7 @@ class PretrainRecordTests(unittest.TestCase):
                 'start_iter': start_iter, 'capture_rng_state': lambda: {},
                 'snapshot': self.checkpoint, 'checkpoint_freq': checkpoint_freq,
                 'checkpoint_milestones': set(checkpoint_milestones),
+                'NonfiniteTrainingError': NonfiniteTrainingError,
             })
 
     def test_sparse_validation_recovery_and_milestones_have_independent_schedules(self):
@@ -299,6 +302,31 @@ class PretrainRecordTests(unittest.TestCase):
         state = self.read_json('run.json')
         self.assertEqual(state['status'], 'interrupted')
         self.assertEqual(state['skipped_iterations'], 0)
+
+    def test_loop_records_nonfinite_loss_and_stops_instead_of_skipping(self):
+        batch = SimpleNamespace(to_dict=lambda: {'mol_id': torch.tensor([7])})
+        error = NonfiniteTrainingError('train_loss', ['loss'],
+                                      {'loss': torch.tensor(float('nan'))}, {'batch': batch})
+        with self.assertRaises(NonfiniteTrainingError):
+            self.run_simulated_loop(Mock(side_effect=error), Mock())
+        state = self.read_json('run.json')
+        self.assertEqual(state['status'], 'failed')
+        self.assertEqual(state['skipped_iterations'], 0)
+        self.assertEqual(state['numerical_failure']['iteration'], 1)
+        self.assertTrue((self.root / 'diagnostics/first_failure.pt').is_file())
+        self.assertIsNone(state['last_checkpoint'])
+
+    def test_failure_snapshot_write_error_is_fatal_not_skipped(self):
+        batch = SimpleNamespace(to_dict=lambda: {'mol_id': torch.tensor([7])})
+        error = NonfiniteTrainingError('train_loss', ['loss'],
+                                      {'loss': torch.tensor(float('nan'))}, {'batch': batch})
+        with patch('utils.pretrain_record.torch.save', side_effect=RuntimeError('disk write failed')):
+            with self.assertRaisesRegex(RuntimeError, 'disk write failed'):
+                self.run_simulated_loop(Mock(side_effect=error), Mock())
+        state = self.read_json('run.json')
+        self.assertEqual(state['status'], 'failed')
+        self.assertEqual(state['skipped_iterations'], 0)
+        self.assertFalse(state['numerical_failure']['snapshot_saved'])
 
 
 class PretrainCompatibilityTests(unittest.TestCase):

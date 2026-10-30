@@ -42,7 +42,7 @@ def prepare_config(base, train_size, directory):
     return config
 
 
-def render_pbs(repo, directory, revision, queue, resources, resume=None):
+def render_pbs(repo, directory, revision, queue, resources, resume=None, allow_shared_gpu=False):
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', queue):
         raise ValueError('Invalid queue')
     if not re.fullmatch(r'[A-Za-z0-9_.,:=+-]+', resources):
@@ -65,6 +65,7 @@ REPO={quote(str(repo))}
 REV={quote(revision)}
 PY={PYTHON}
 ENV_ROOT=/home/zhuenqiang_1/.conda/envs/MDRL
+ALLOW_SHARED_GPU={int(allow_shared_gpu)}
 exec > "$JOB_DIR/launcher.log" 2>&1
 echo "launcher_start=$(date -Is) host=$(hostname) job=${{PBS_JOBID:-unknown}}"
 trap 'rc=$?; echo "launcher_exit_status=$rc"; echo "launcher_end=$(date -Is)"; exit "$rc"' EXIT
@@ -85,7 +86,12 @@ test -x "$PY"
     echo 'ERROR: repository changed after preparation'; exit 2;
 }}
 pids=$(nvidia-smi -i 0 --query-compute-apps=pid --format=csv,noheader)
-[[ -z "$pids" ]] || {{ echo "ERROR: GPU 0 has active compute processes: $pids"; exit 2; }}
+if [[ -n "$pids" ]]; then
+    if [[ "$ALLOW_SHARED_GPU" != 1 ]]; then
+        echo "ERROR: GPU 0 has active compute processes: $pids"; exit 2
+    fi
+    echo "WARNING: GPU sharing explicitly allowed; existing compute PIDs: $pids"
+fi
 nvidia-smi -i 0
 "$PY" -B -c "import torch; print('torch=', torch.__version__, 'cuda=', torch.version.cuda, 'gpu=', torch.cuda.get_device_name(0))"
 "$PY" -u -B scripts/train_drug3d.py --config "$JOB_DIR/config.yml" --logdir "$JOB_DIR/training" --device cuda:0{resume_arg}
@@ -109,6 +115,8 @@ def main():
     parser.add_argument('--queue', default='gentai')
     parser.add_argument('--resources', default='nodes=node5:ppn=15,walltime=240:00:00')
     parser.add_argument('--resume', type=Path, help='Trusted complete checkpoint from this training recipe')
+    parser.add_argument('--allow-shared-gpu', action='store_true',
+                        help='Allow existing GPU compute processes; log them without stopping')
     parser.add_argument('--run-id', default='mdrl-node5-b16-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'))
     args = parser.parse_args()
     if sys.platform != 'linux':
@@ -135,7 +143,8 @@ def main():
         best_path = find_resume_best(str(resume), saved)
         resume_info = {'checkpoint': str(resume), 'iteration': saved['iteration'],
                        'source_run_id': saved['run_id'], 'best_checkpoint': best_path}
-    source = render_pbs(ROOT, directory, version['commit'], args.queue, args.resources, resume)
+    source = render_pbs(ROOT, directory, version['commit'], args.queue, args.resources, resume,
+                        args.allow_shared_gpu)
     train = config['train']
     validations = list(range(train['val_freq'], train['max_iters'] + 1, train['val_freq']))
     if train['max_iters'] not in validations:
@@ -147,6 +156,7 @@ def main():
     write_json(directory / 'protocol.json', {
         'experiment': 'mdrl-node5-b16-pretraining', 'run_id': args.run_id, 'git': version,
         'node': 'node5', 'physical_gpu': 0, 'queue': args.queue, 'resources': args.resources,
+        'allow_shared_gpu': args.allow_shared_gpu,
         'train_size': train_size, 'raw_train_split_entries': len(split['train']),
         'steps_per_epoch': (train_size + train['batch_size'] - 1) // train['batch_size'],
         'batch_size': train['batch_size'], 'num_workers': train['num_workers'],
@@ -160,7 +170,12 @@ def main():
         'best_rule': 'lowest finite validation total loss; first occurrence on ties',
         'scheduler_note': 'Original validation-driven scheduler; called only at the new validation cadence',
         'milestone_note': 'Non-validation milestone does not affect best or scheduler',
-        'training_error_policy': 'Original RuntimeErrors are recorded/skipped; any skip is not a clean completion',
+        'training_error_policy': 'Nonfinite losses or gradient norms stop before further updates; '
+                                 'other original RuntimeErrors are recorded/skipped; '
+                                 'any skip is not a clean completion',
+        'numerical_failure_artifacts': ['diagnostics/first_failure.json', 'diagnostics/first_failure.pt'],
+        'numerical_failure_note': 'A stop records an observed nonfinite value; '
+                                  'it does not by itself prove permanent weight corruption or its cause',
     })
     with (directory / 'job.pbs').open('x', encoding='utf-8', newline='\n') as handle:
         handle.write(source)

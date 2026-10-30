@@ -17,6 +17,7 @@ from utils.dataset import get_dataset
 from utils.transforms import FeaturizeMol, Compose
 from utils.misc import *
 from utils.train import *
+from utils.pretrain_checks import NonfiniteTrainingError, require_finite
 from utils.pretrain_record import PretrainRecord, git_version
 from utils.pretrain_resume import (capture_rng_state, find_resume_best,
                                    load_resume_checkpoint, restore_training_state)
@@ -95,6 +96,7 @@ def run_training(args, config, logger, writer, record, resume_checkpoint=None):
         batch = next(train_iterator).to(args.device)
         
         pos_noise = torch.randn_like(batch.node_pos) * config.train.pos_noise_std
+        rng_before_loss = capture_rng_state()
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=config.train.use_amp):
             loss_dict = model.get_loss(
                 # compose
@@ -106,10 +108,15 @@ def run_training(args, config, logger, writer, record, resume_checkpoint=None):
                 batch_halfedge = batch.halfedge_type_batch,
                 num_mol = batch.num_graphs,
             )
+        context = {'batch': batch, 'pos_noise': pos_noise,
+                   'rng_before_loss': rng_before_loss, 'losses': loss_dict}
+        require_finite('train_loss', loss_dict, context)
         loss = loss_dict['loss']
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         orig_grad_norm = clip_grad_norm_(model.parameters(), config.train.max_grad_norm)
+        # The returned norm describes the unclipped gradients; stop before step().
+        require_finite('train_gradient_norm', {'gradient_norm': orig_grad_norm}, context)
         scaler.step(optimizer)
         scaler.update()
 
@@ -128,8 +135,9 @@ def run_training(args, config, logger, writer, record, resume_checkpoint=None):
         sum_loss_dict = {} 
         with torch.no_grad():
             model.eval()
-            for batch in tqdm(val_loader, desc='Validate'):
+            for batch_index, batch in enumerate(tqdm(val_loader, desc='Validate'), 1):
                 batch = batch.to(args.device)
+                rng_before_loss = capture_rng_state()
                 with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=config.train.use_amp):
                     loss_dict = model.get_loss(
                         # compose
@@ -141,6 +149,10 @@ def run_training(args, config, logger, writer, record, resume_checkpoint=None):
                         batch_halfedge = batch.halfedge_type_batch,
                         num_mol = batch.num_graphs,
                     )
+                require_finite('validation_loss', loss_dict, {
+                    'batch': batch, 'validation_batch_index': batch_index,
+                    'rng_before_loss': rng_before_loss, 'losses': loss_dict,
+                })
                 if len(sum_loss_dict) == 0:
                     sum_loss_dict = {k: v.item() for k, v in loss_dict.items()}
                 else:
@@ -183,13 +195,23 @@ def run_training(args, config, logger, writer, record, resume_checkpoint=None):
         try:
             train(it)
             record.state['completed_train_calls'] += 1
+        except NonfiniteTrainingError as e:
+            record.record_numerical_failure(e, snapshot(it), {
+                name: parameter.grad for name, parameter in model.named_parameters()
+                if parameter.grad is not None
+            })
+            raise
         except RuntimeError as e:
             logger.error('Runtime Error ' + str(e))
             logger.error('Skipping Iteration %d' % it)
             record.record_skip(e)
         if it % config.train.val_freq == 0 or it == config.train.max_iters:
             record.state['phase'] = 'validation'
-            validation_losses = validate(it)
+            try:
+                validation_losses = validate(it)
+            except NonfiniteTrainingError as e:
+                record.record_numerical_failure(e, snapshot(it), {})
+                raise
             record.state['phase'] = 'checkpoint'
             improved = record.save_checkpoint(snapshot(it), validation_losses)
             if improved:

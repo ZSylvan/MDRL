@@ -61,7 +61,7 @@ Preserve config.yml, protocol.json, job.pbs, launcher.log, pbs.out, the training
 directory's config copy, run.json, log.txt, TensorBoard events, validation.jsonl,
 checkpoints.jsonl, failures.jsonl and checkpoints. `checkpoints.jsonl` separates
 validation, milestone and recovery-only saves. Validation entries alone select
-best. Original training RuntimeErrors are still recorded/skipped; the wrapper
+best. Other original training RuntimeErrors are still recorded/skipped; the wrapper
 reports a nonzero job exit for a completed run with any skips. AMP may separately
 skip optimizer updates; completed_train_calls is not a guarantee of updates.
 
@@ -88,10 +88,13 @@ policy. The node4 probe still defaults to its prior validation behavior.
 Use the clean Gitee checkout. The queue/resource syntax follows the previous
 gentai examples; node5 must actually belong to that queue and permit 15 slots.
 Physical GPU selection is not an atomic GPU reservation. The launcher rejects
-a conflicting scheduler GPU mask and active compute processes; it never kills
+a conflicting scheduler GPU mask and, by default, active compute processes; it never kills
 another job. It checks hostname, Python, committed Git revision and clean state.
 It logs actual GPU and Torch/CUDA details; node4 success is not proof of node5
-runtime compatibility. Missing environment/data or a busy GPU stops the launch.
+runtime compatibility. Missing environment/data stops the launch. A busy GPU
+also stops it unless `--allow-shared-gpu` was explicitly provided when preparing
+the PBS. That option records existing compute PIDs and the nvidia-smi snapshot
+before proceeding; it does not reserve memory or guarantee freedom from OOM.
 
 ```bash
 (
@@ -160,3 +163,95 @@ qsub, qdel, signal handler emergency checkpoint or retry is implemented.
 
 All these files are pretraining artifacts, not dual-target fine-tuning results
 or independent generated-molecule evaluation. The latter remains separate work.
+
+## Guarded continuation from the healthy best
+
+The October 30 continuation uses the stopped batch16 run's `best.pt` at
+iteration 723550, not its contaminated last checkpoint or the 868260 checkpoint
+whose validation losses were nonfinite. The source directory is
+`mdrl-node5-b16-20261026T041227Z/training/config_20261026_185804/checkpoints`.
+The source is preserved. Training resumes at 723551 in a new directory, with
+the full optimizer, scheduler, AMP scaler, RNG, counters and historical best.
+The total target remains 2400000. The next scheduled validation is 868260;
+validation is still tied to global steps, not ten fresh epochs after restart.
+
+No learning rate, AMP, model, loss or optimizer setting is changed. Added checks
+stop on NaN or infinity in any loss component before backward, or in the
+unscaled total gradient norm before the optimizer update. Validation also stops
+at the first batch with a nonfinite loss, before averaging, scheduling or saving
+best. The original gradient-clipping call is retained. Its returned norm is
+measured before clipping; the diagnostic gradient tensors are captured after
+clipping, and are labeled accordingly. Other RuntimeErrors retain the existing
+record-and-skip behavior, including OOM.
+
+On a numerical stop, the training directory retains:
+
+- `diagnostics/first_failure.json`: step, phase, failing fields, molecule IDs
+  when available, validation batch index, and best/last references.
+- `diagnostics/first_failure.pt`: batch tensors, position noise when applicable,
+  RNG immediately before the loss call, loss values, model/optimizer/scheduler/
+  scaler state, gradients when applicable, and counters.
+- `run.json` with failed status and `failures.jsonl` with the error traceback.
+
+The diagnostic PT is **not resumable** and cannot replace best/last or enter
+checkpoint selection. It is a separate one-time failure artifact beyond the
+50 regular checkpoint limit. A second diagnostic write refuses replacement;
+write failures are fatal and recorded, not skipped as training errors.
+Resume preparation rejects nonfinite model/optimizer/scaler state and a
+nonpositive AMP scale. Legitimate scheduler infinity sentinels remain allowed.
+
+An observed overflow is evidence of that event, not proof that all weights
+were permanently corrupted or that all official-default runs necessarily fail.
+AMP may normally skip an overflowing update. This continuation intentionally
+stops earlier to preserve the first observed event; the checks do not fix its
+cause. Batch16 and the changed validation schedule are already documented
+departures from the upstream recipe.
+
+The inherited checkpoint has one historical skipped iteration. Counters are
+not reset: even if the continuation reaches the target without a new skip,
+the existing completion policy reports `completed_with_skips` and PBS exit 2.
+Inspect the recorded status and failure list rather than treating that final
+exit code alone as a new numerical failure.
+
+GPU sharing was explicitly approved for this continuation. It can increase OOM
+risk and change timing. It does not permit stopping another user's process.
+The 300-hour walltime below follows the prior run's resource setting; no job
+is submitted by the generator.
+
+```bash
+(
+set -euo pipefail
+BASE=/home/zhuenqiang_1/Student_Project/zms
+cd "$BASE/project/MDRL"
+git pull --ff-only origin mdrl-reproduction
+PY=/home/zhuenqiang_1/.conda/envs/MDRL/bin/python
+SOURCE="$BASE/experiment_data/mdrl/pretrain/mdrl-node5-b16-20261026T041227Z/training/config_20261026_185804/checkpoints/best.pt"
+RUN_ID="mdrl-node5-b16-guarded-$(date -u +%Y%m%dT%H%M%SZ)"
+RUN="$BASE/experiment_data/mdrl/pretrain/$RUN_ID"
+"$PY" -B scripts/prepare_pretrain_pbs.py \
+    --run-id "$RUN_ID" --resume "$SOURCE" --allow-shared-gpu \
+    --queue gentai --resources 'nodes=node5:ppn=15,walltime=300:00:00'
+bash -n "$RUN/job.pbs"
+cat "$RUN/protocol.json"
+printf '\nSubmission command (not executed):\nqsub %q\n' "$RUN/job.pbs"
+)
+```
+
+Local CPU tests exercise the actual train/validate function bodies and outer
+loop with injected bad losses/gradients, verifying stop-before-update, failure
+records, preserved aliases and rejected invalid resume states. They do not
+reproduce the server's original NaN cause. All 79 local tests passed, including
+PBS sharing-option coverage and Bash syntax checks. Loading the real downloaded
+checkpoint locally was blocked by missing `easydict`; no dependency was
+installed. The server generator checks the real checkpoint/config before
+creating the job directory, and the trainer repeats the check at startup.
+
+Publish this continuation's scoped changes locally:
+
+```powershell
+Set-Location 'D:\zhou\Research\project\MDRL'
+git add -- scripts/train_drug3d.py scripts/prepare_pretrain_pbs.py utils/pretrain_checks.py utils/pretrain_record.py utils/pretrain_resume.py tests/test_pretrain_checks.py tests/test_pretrain_record.py tests/test_pretrain_resume.py tests/test_node5_pretrain.py docs/node5_pretraining.md
+git diff --cached --stat
+git commit -m "Guard nonfinite training and resume batch16 with explicit GPU sharing"
+git push gitee mdrl-reproduction
+```

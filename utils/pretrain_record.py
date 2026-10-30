@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 
 import torch
 
+from utils.pretrain_checks import cpu_tree
+
 
 SELECTION_RULE = 'lowest finite validation total loss; first occurrence on ties'
 MAX_PERIODIC_CHECKPOINTS = 50
@@ -102,6 +104,42 @@ class PretrainRecord:
             'error_type': type(exc).__name__, 'error': str(exc),
             'traceback': ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
         })
+        self._write_state()
+
+    def record_numerical_failure(self, exc, checkpoint, gradients):
+        directory = os.path.join(self.log_dir, 'diagnostics')
+        os.mkdir(directory)
+        event = {
+            'time': _now(), 'iteration': self.state['iteration'],
+            'phase': self.state['phase'], 'stage': exc.stage,
+            'nonfinite_fields': exc.fields,
+            'validation_batch_index': exc.context.get('validation_batch_index'),
+            'snapshot': 'diagnostics/first_failure.pt',
+            'gradient_snapshot_stage': ('after_clipping_before_optimizer_step'
+                                        if exc.stage == 'train_gradient_norm' else None),
+            'last_checkpoint': self.state['last_checkpoint'],
+            'best': self.state['best'], 'snapshot_saved': False,
+        }
+        self.state['numerical_failure'] = event
+        context = dict(exc.context)
+        batch = cpu_tree(context.pop('batch').to_dict())
+        ids = batch.get('mol_id')
+        event['molecule_ids'] = ids.reshape(-1).tolist() if torch.is_tensor(ids) else ids
+        payload = cpu_tree({
+            'diagnostic_only': True, 'iteration': self.state['iteration'],
+            'stage': exc.stage, 'nonfinite_fields': exc.fields,
+            'batch': batch, 'context': context, 'values': exc.values,
+            'training_state': checkpoint, 'gradients': gradients,
+            'run_id': self.state['run_id'], 'metadata': self.state['metadata'],
+            'completed_train_calls': self.state['completed_train_calls'],
+            'skipped_iterations': self.state['skipped_iterations'],
+        })
+        with open(os.path.join(directory, 'first_failure.pt'), 'xb') as handle:
+            torch.save(payload, handle)
+        event['snapshot_saved'] = True
+        with open(os.path.join(directory, 'first_failure.json'), 'x', encoding='utf-8') as handle:
+            json.dump(event, handle, indent=2, allow_nan=False)
+            handle.write('\n')
         self._write_state()
 
     def resume_from(self, checkpoint, source_path, best_path):
