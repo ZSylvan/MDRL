@@ -24,6 +24,8 @@ def main():
     parser.add_argument('--checkpoint', type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument('--expected-iteration', type=int, default=723550)
     parser.add_argument('--sa-scores', type=Path)
+    parser.add_argument('--allow-shared-gpu', action='store_true',
+                        help='Allow existing GPU compute processes; log them without stopping')
     args = parser.parse_args()
     if sys.platform != 'linux':
         parser.error('Generate the PBS on the Linux server after pulling committed code')
@@ -51,6 +53,7 @@ def main():
         'sa_scores': str(args.sa_scores.resolve()) if args.sa_scores is not None else None,
         'git': {'commit': revision, 'dirty': False},
         'node': 'node5', 'physical_gpu': 0, 'cpu_slots': 15,
+        'allow_shared_gpu': args.allow_shared_gpu,
         'queue': 'gentai', 'walltime': '24:00:00', 'replacement_sampling': False,
     }
     quote = shlex.quote
@@ -67,6 +70,7 @@ REPO={quote(str(ROOT))}
 REV={quote(revision)}
 PY={quote(PYTHON)}
 ENV_ROOT=/home/zhuenqiang_1/.conda/envs/MDRL
+ALLOW_SHARED_GPU={int(args.allow_shared_gpu)}
 exec > "$JOB_DIR/launcher.log" 2>&1
 echo "launcher_start=$(date -Is) host=$(hostname) job=${{PBS_JOBID:-unknown}}"
 trap 'rc=$?; echo "launcher_exit_status=$rc"; echo "launcher_end=$(date -Is)"; exit "$rc"' EXIT
@@ -87,7 +91,12 @@ test -x "$PY"
     echo 'ERROR: repository changed after preparation'; exit 2;
 }}
 pids=$(nvidia-smi -i 0 --query-compute-apps=pid --format=csv,noheader)
-[[ -z "$pids" ]] || {{ echo "ERROR: GPU 0 is occupied: $pids"; exit 2; }}
+if [[ -n "$pids" ]]; then
+    if [[ "$ALLOW_SHARED_GPU" != 1 ]]; then
+        echo "ERROR: GPU 0 is occupied: $pids"; exit 2
+    fi
+    echo "WARNING: GPU sharing explicitly allowed; existing compute PIDs: $pids"
+fi
 nvidia-smi -i 0
 "$PY" -u -B scripts/sample_best_probe.py --config "$JOB_DIR/config.json"
 '''

@@ -66,10 +66,14 @@ PY=/home/zhuenqiang_1/.conda/envs/MDRL/bin/python
 ```
 
 Inspect config.json, check the generated script with bash -n, and manually execute
-the printed qsub command. The launcher refuses an occupied GPU, a conflicting GPU
-mask, or a changed/dirty checkout. Confirm the old node5 training job has stopped;
-this experiment never cancels jobs. CPU slots/manual CUDA visibility alone do not
-reserve the GPU against other users.
+the printed qsub command. By default, the launcher refuses an occupied GPU. When
+GPU sharing is permitted, pass --allow-shared-gpu during preparation to allow
+existing compute processes. This choice is recorded in config.json and existing
+PIDs are logged at launch; it does not limit or stop other processes, reserve
+memory, or guarantee against OOM or slowdowns. Sampling parameters are unchanged.
+Conflicting GPU masks and changed/dirty checkouts are still refused. This
+experiment never cancels jobs. CPU slots/manual CUDA visibility alone do not
+reserve the GPU against other users. Use a new run ID for every retry.
 
 For another trusted checkpoint, explicitly supply --checkpoint and the matching
 --expected-iteration. Do not point this experiment at a contaminated last.pt.
