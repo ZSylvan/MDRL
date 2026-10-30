@@ -1,4 +1,4 @@
-"""Prepare an independent node5 batch-16 pretraining job; never submit it."""
+"""Prepare an independent batch-16 pretraining job; never submit it."""
 
 import argparse
 import copy
@@ -53,7 +53,7 @@ def render_pbs(repo, directory, revision, queue, resources, resume=None, allow_s
     quote = shlex.quote
     resume_arg = ' --resume ' + quote(str(resume)) if resume is not None else ''
     return f'''#!/bin/bash
-#PBS -N mdrl-node5-b16
+#PBS -N mdrl-pre-b16
 #PBS -q {queue}
 #PBS -l {resources}
 #PBS -j oe
@@ -69,13 +69,17 @@ ALLOW_SHARED_GPU={int(allow_shared_gpu)}
 exec > "$JOB_DIR/launcher.log" 2>&1
 echo "launcher_start=$(date -Is) host=$(hostname) job=${{PBS_JOBID:-unknown}}"
 trap 'rc=$?; echo "launcher_exit_status=$rc"; echo "launcher_end=$(date -Is)"; exit "$rc"' EXIT
+if [[ -r "${{PBS_NODEFILE:-}}" ]]; then
+    echo "allocated_cpu_slots=$(wc -l < "$PBS_NODEFILE")"
+    echo 'allocated_nodes:'
+    cat "$PBS_NODEFILE"
+fi
 export PATH="$ENV_ROOT/bin:$PATH"
 export LD_LIBRARY_PATH="$ENV_ROOT/lib:${{LD_LIBRARY_PATH:-}}"
 export CONDA_PREFIX="$ENV_ROOT" CONDA_DEFAULT_ENV=MDRL
 export PYTHONPATH="$REPO${{PYTHONPATH:+:$PYTHONPATH}}"
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
-[[ "$(hostname -s)" == node5 ]] || {{ echo 'ERROR: expected node5'; exit 2; }}
 if [[ -n "${{CUDA_VISIBLE_DEVICES:-}}" && "$CUDA_VISIBLE_DEVICES" != 0 ]]; then
     echo 'ERROR: scheduler GPU mask differs from physical GPU 0'; exit 2
 fi
@@ -155,7 +159,9 @@ def main():
         yaml.safe_dump(config, handle, sort_keys=False)
     write_json(directory / 'protocol.json', {
         'experiment': 'mdrl-node5-b16-pretraining', 'run_id': args.run_id, 'git': version,
-        'node': 'node5', 'physical_gpu': 0, 'queue': args.queue, 'resources': args.resources,
+        'physical_gpu': 0, 'queue': args.queue, 'resources': args.resources,
+        'placement_note': 'Resources are requested at preparation; PBS directives may be edited. '
+                          'Actual host and allocated slots are recorded in launcher.log',
         'allow_shared_gpu': args.allow_shared_gpu,
         'train_size': train_size, 'raw_train_split_entries': len(split['train']),
         'steps_per_epoch': (train_size + train['batch_size'] - 1) // train['batch_size'],

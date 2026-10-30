@@ -86,15 +86,23 @@ policy. The node4 probe still defaults to its prior validation behavior.
 ## Server preparation and submission
 
 Use the clean Gitee checkout. The queue/resource syntax follows the previous
-gentai examples; node5 must actually belong to that queue and permit 15 slots.
+gentai examples. Node5 and 15 slots are defaults, not launch restrictions:
+choose another available node/CPU count via `--resources`, or edit `#PBS -l`
+in the generated PBS before submission. The recipe file's node5 name is historical;
+it does not restrict execution to node5. Changing placement does not change the
+batch, loader workers, learning rate, validation schedule or checkpoint source.
 Physical GPU selection is not an atomic GPU reservation. The launcher rejects
 a conflicting scheduler GPU mask and, by default, active compute processes; it never kills
-another job. It checks hostname, Python, committed Git revision and clean state.
-It logs actual GPU and Torch/CUDA details; node4 success is not proof of node5
+another job. It checks Python, committed Git revision and clean state.
+It records the actual hostname, PBS node-file slots/nodes when available, GPU
+and Torch/CUDA details. It does not reject a different hostname. Node4 success is not proof of node5
 runtime compatibility. Missing environment/data stops the launch. A busy GPU
 also stops it unless `--allow-shared-gpu` was explicitly provided when preparing
 the PBS. That option records existing compute PIDs and the nvidia-smi snapshot
 before proceeding; it does not reserve memory or guarantee freedom from OOM.
+`protocol.json` preserves the resources supplied at generation. If the PBS is
+edited later, retain that final PBS and the actual-placement launcher log too;
+the protocol's original resource request is not evidence of the execution host.
 
 ```bash
 (
@@ -240,8 +248,8 @@ printf '\nSubmission command (not executed):\nqsub %q\n' "$RUN/job.pbs"
 Local CPU tests exercise the actual train/validate function bodies and outer
 loop with injected bad losses/gradients, verifying stop-before-update, failure
 records, preserved aliases and rejected invalid resume states. They do not
-reproduce the server's original NaN cause. All 79 local tests passed, including
-PBS sharing-option coverage and Bash syntax checks. Loading the real downloaded
+reproduce the server's original NaN cause. All 80 local tests passed, including
+editable node/CPU placement, PBS sharing options and Bash syntax checks. Loading the real downloaded
 checkpoint locally was blocked by missing `easydict`; no dependency was
 installed. The server generator checks the real checkpoint/config before
 creating the job directory, and the trainer repeats the check at startup.

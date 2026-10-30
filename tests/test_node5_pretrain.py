@@ -77,7 +77,8 @@ class Node5PretrainTests(unittest.TestCase):
                                 'nodes=node5:ppn=15,walltime=240:00:00')
         self.assertIn('#PBS -l nodes=node5:ppn=15,walltime=240:00:00', source)
         self.assertIn('export CUDA_VISIBLE_DEVICES=0', source)
-        self.assertIn('"$(hostname -s)" == node5', source)
+        self.assertNotIn('ERROR: expected node5', source)
+        self.assertIn('host=$(hostname)', source)
         self.assertIn('--device cuda:0', source)
         self.assertIn('--query-compute-apps=pid', source)
         self.assertIn('ALLOW_SHARED_GPU=0', source)
@@ -86,6 +87,22 @@ class Node5PretrainTests(unittest.TestCase):
         self.assertIn('OPENBLAS_NUM_THREADS=1', source)
         self.assertNotIn('qsub', source)
         self.assertNotIn('--resume', source)
+        if BASH and Path(BASH).is_file():
+            checked = subprocess.run([BASH, '--noprofile', '--norc', '-n'], input=source,
+                                     text=True, capture_output=True)
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_pbs_allows_a_different_node_and_cpu_request_without_changing_training(self):
+        source = job.render_pbs('/server/repo', '/server/run', 'abc', 'gentai',
+                                'nodes=node4:ppn=8,walltime=300:00:00',
+                                '/server/old/checkpoints/best.pt', allow_shared_gpu=True)
+        self.assertIn('#PBS -l nodes=node4:ppn=8,walltime=300:00:00', source)
+        self.assertNotIn('hostname -s', source)
+        self.assertNotIn('ERROR: expected node5', source)
+        self.assertIn('host=$(hostname)', source)
+        self.assertIn('PBS_NODEFILE', source)
+        self.assertIn('--resume /server/old/checkpoints/best.pt', source)
+        self.assertIn('ALLOW_SHARED_GPU=1', source)
         if BASH and Path(BASH).is_file():
             checked = subprocess.run([BASH, '--noprofile', '--norc', '-n'], input=source,
                                      text=True, capture_output=True)
@@ -164,6 +181,7 @@ class Node5PretrainTests(unittest.TestCase):
                 self.assertEqual(protocol['planned_named_checkpoint_iterations'], [10, 16, 20, 24])
                 self.assertEqual(protocol['planned_files_without_resume'], 6)
                 self.assertTrue(protocol['allow_shared_gpu'])
+                self.assertNotIn('node', protocol)
                 before = {path.name: path.read_bytes() for path in run.iterdir()}
                 with self.assertRaises(FileExistsError):
                     job.main()
