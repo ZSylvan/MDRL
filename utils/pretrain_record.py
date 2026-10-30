@@ -49,6 +49,8 @@ class PretrainRecord:
             'iteration': 0,
             'completed_train_calls': 0,
             'skipped_iterations': 0,
+            'amp_skipped_updates': 0,
+            'amp_tracking_start_iteration': 1,
             'fatal_errors': 0,
             'best': None,
             'last_checkpoint': None,
@@ -59,7 +61,7 @@ class PretrainRecord:
             'periodic_checkpoints': [],
             'metadata': metadata,
         }
-        for name in ('validation.jsonl', 'failures.jsonl', 'checkpoints.jsonl'):
+        for name in ('validation.jsonl', 'failures.jsonl', 'checkpoints.jsonl', 'amp_events.jsonl'):
             with open(os.path.join(log_dir, name), 'x', encoding='utf-8'):
                 pass
         self._write_state()
@@ -107,20 +109,42 @@ class PretrainRecord:
         self._write_state()
 
     def record_numerical_failure(self, exc, checkpoint, gradients):
+        self._save_numerical_snapshot(exc, checkpoint, gradients, 'first_failure', 'numerical_failure')
+
+    def record_amp_skip(self, event, checkpoint, gradients):
+        self.state['amp_skipped_updates'] += 1
+        first = 'first_amp_skip' not in self.state
+        details = {'optimizer_step_skipped': True, 'scale_before': event.scale_before,
+                   'scale_after': event.scale_after}
+        if first:
+            self._save_numerical_snapshot(event.error, checkpoint, gradients,
+                                          'first_amp_skip', 'first_amp_skip', details)
+        self._append('amp_events.jsonl', {
+            'time': _now(), 'iteration': self.state['iteration'],
+            'stage': event.error.stage, 'nonfinite_fields': event.error.fields,
+            'losses': {key: value.item() for key, value in event.error.context['losses'].items()},
+            'amp_skipped_updates': self.state['amp_skipped_updates'],
+            'snapshot': 'diagnostics/first_amp_skip.pt' if first else None,
+            **details,
+        })
+        self._write_state()
+
+    def _save_numerical_snapshot(self, exc, checkpoint, gradients, stem, state_key, details=None):
         directory = os.path.join(self.log_dir, 'diagnostics')
-        os.mkdir(directory)
+        os.makedirs(directory, exist_ok=True)
         event = {
             'time': _now(), 'iteration': self.state['iteration'],
             'phase': self.state['phase'], 'stage': exc.stage,
             'nonfinite_fields': exc.fields,
             'validation_batch_index': exc.context.get('validation_batch_index'),
-            'snapshot': 'diagnostics/first_failure.pt',
+            'snapshot': 'diagnostics/%s.pt' % stem,
             'gradient_snapshot_stage': ('after_clipping_before_optimizer_step'
                                         if exc.stage == 'train_gradient_norm' else None),
             'last_checkpoint': self.state['last_checkpoint'],
             'best': self.state['best'], 'snapshot_saved': False,
         }
-        self.state['numerical_failure'] = event
+        event.update(details or {})
+        self.state[state_key] = event
         context = dict(exc.context)
         batch = cpu_tree(context.pop('batch').to_dict())
         ids = batch.get('mol_id')
@@ -133,11 +157,13 @@ class PretrainRecord:
             'run_id': self.state['run_id'], 'metadata': self.state['metadata'],
             'completed_train_calls': self.state['completed_train_calls'],
             'skipped_iterations': self.state['skipped_iterations'],
+            'amp_skipped_updates': self.state['amp_skipped_updates'],
+            'event_details': details,
         })
-        with open(os.path.join(directory, 'first_failure.pt'), 'xb') as handle:
+        with open(os.path.join(directory, stem + '.pt'), 'xb') as handle:
             torch.save(payload, handle)
         event['snapshot_saved'] = True
-        with open(os.path.join(directory, 'first_failure.json'), 'x', encoding='utf-8') as handle:
+        with open(os.path.join(directory, stem + '.json'), 'x', encoding='utf-8') as handle:
             json.dump(event, handle, indent=2, allow_nan=False)
             handle.write('\n')
         self._write_state()
@@ -148,6 +174,9 @@ class PretrainRecord:
             'iteration': checkpoint['iteration'],
             'completed_train_calls': checkpoint['completed_train_calls'],
             'skipped_iterations': checkpoint['skipped_iterations'],
+            'amp_skipped_updates': checkpoint.get('amp_skipped_updates', 0),
+            'amp_tracking_start_iteration': checkpoint.get('amp_tracking_start_iteration',
+                                                           checkpoint['iteration'] + 1),
             'resume': {
                 'checkpoint': os.path.abspath(source_path),
                 'source_run_id': checkpoint['run_id'],
@@ -195,6 +224,8 @@ class PretrainRecord:
             'run_id': self.state['run_id'],
             'completed_train_calls': self.state['completed_train_calls'],
             'skipped_iterations': self.state['skipped_iterations'],
+            'amp_skipped_updates': self.state['amp_skipped_updates'],
+            'amp_tracking_start_iteration': self.state['amp_tracking_start_iteration'],
             'selection_rule': SELECTION_RULE,
             'periodic_checkpoint_limit': self.state['periodic_checkpoint_limit'],
             'pinned_iterations': self.state['pinned_iterations'],
@@ -240,6 +271,7 @@ class PretrainRecord:
                 'pruned_checkpoints': pruned,
                 'completed_train_calls': self.state['completed_train_calls'],
                 'skipped_iterations': self.state['skipped_iterations'],
+                'amp_skipped_updates': self.state['amp_skipped_updates'],
             })
         self._write_state()
         return improved

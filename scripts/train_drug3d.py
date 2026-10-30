@@ -17,7 +17,8 @@ from utils.dataset import get_dataset
 from utils.transforms import FeaturizeMol, Compose
 from utils.misc import *
 from utils.train import *
-from utils.pretrain_checks import NonfiniteTrainingError, require_finite
+from utils.pretrain_checks import (AmpSkippedUpdate, NonfiniteTrainingError,
+                                    handle_amp_gradient, require_amp_scale, require_finite)
 from utils.pretrain_record import PretrainRecord, git_version
 from utils.pretrain_resume import (capture_rng_state, find_resume_best,
                                    load_resume_checkpoint, restore_training_state)
@@ -115,10 +116,14 @@ def run_training(args, config, logger, writer, record, resume_checkpoint=None):
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         orig_grad_norm = clip_grad_norm_(model.parameters(), config.train.max_grad_norm)
-        # The returned norm describes the unclipped gradients; stop before step().
-        require_finite('train_gradient_norm', {'gradient_norm': orig_grad_norm}, context)
+        # The returned norm describes the unclipped gradients.
+        try:
+            require_finite('train_gradient_norm', {'gradient_norm': orig_grad_norm}, context)
+        except NonfiniteTrainingError as error:
+            raise handle_amp_gradient(error, scaler, optimizer)
         scaler.step(optimizer)
         scaler.update()
+        require_amp_scale(scaler, context)
 
         log_info = '[Train] Iter %d | ' % it + ' | '.join([
             '%s: %.6f' % (k, v.item()) for k, v in loss_dict.items()
@@ -195,6 +200,15 @@ def run_training(args, config, logger, writer, record, resume_checkpoint=None):
         try:
             train(it)
             record.state['completed_train_calls'] += 1
+        except AmpSkippedUpdate as event:
+            record.state['completed_train_calls'] += 1
+            record.record_amp_skip(event, snapshot(it), {
+                name: parameter.grad for name, parameter in model.named_parameters()
+                if parameter.grad is not None
+            })
+            logger.warning('[AMP] Iter %d | parameter update skipped | scale %s -> %s | loss %.6f',
+                           it, event.scale_before, event.scale_after,
+                           event.error.context['losses']['loss'].item())
         except NonfiniteTrainingError as e:
             record.record_numerical_failure(e, snapshot(it), {
                 name: parameter.grad for name, parameter in model.named_parameters()

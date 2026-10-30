@@ -10,7 +10,7 @@ import torch
 import yaml
 
 from utils.pretrain_record import MAX_PERIODIC_CHECKPOINTS, PretrainRecord, SELECTION_RULE
-from utils.pretrain_checks import NonfiniteTrainingError
+from utils.pretrain_checks import AmpSkippedUpdate, NonfiniteTrainingError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -247,6 +247,7 @@ class PretrainRecordTests(unittest.TestCase):
                 'snapshot': self.checkpoint, 'checkpoint_freq': checkpoint_freq,
                 'checkpoint_milestones': set(checkpoint_milestones),
                 'NonfiniteTrainingError': NonfiniteTrainingError,
+                'AmpSkippedUpdate': AmpSkippedUpdate,
             })
 
     def test_sparse_validation_recovery_and_milestones_have_independent_schedules(self):
@@ -315,6 +316,35 @@ class PretrainRecordTests(unittest.TestCase):
         self.assertEqual(state['numerical_failure']['iteration'], 1)
         self.assertTrue((self.root / 'diagnostics/first_failure.pt').is_file())
         self.assertIsNone(state['last_checkpoint'])
+
+    def test_loop_continues_after_confirmed_amp_skip_and_keeps_validation_schedule(self):
+        batch = SimpleNamespace(to_dict=lambda: {'mol_id': torch.tensor([7])})
+        error = NonfiniteTrainingError('train_gradient_norm', ['gradient_norm'],
+                                      {'gradient_norm': torch.tensor(float('nan'))},
+                                      {'batch': batch, 'losses': {'loss': torch.tensor(1.0)}})
+        event = AmpSkippedUpdate(error, 2048.0, 1024.0)
+        train = Mock(side_effect=[event, None, None])
+        validate = Mock(return_value={'loss': 1.0})
+        self.run_simulated_loop(train, validate)
+        state = self.read_json('run.json')
+        self.assertEqual(state['status'], 'completed')
+        self.assertEqual(state['completed_train_calls'], 3)
+        self.assertEqual(state['skipped_iterations'], 0)
+        self.assertEqual(state['amp_skipped_updates'], 1)
+        self.assertEqual([call.args[0] for call in train.call_args_list], [1, 2, 3])
+        self.assertEqual([call.args[0] for call in validate.call_args_list], [2, 3])
+        self.assertEqual(self.read_events('failures.jsonl'), [])
+
+    def test_amp_snapshot_write_error_is_fatal_not_an_original_runtime_skip(self):
+        batch = SimpleNamespace(to_dict=lambda: {'mol_id': torch.tensor([7])})
+        error = NonfiniteTrainingError('train_gradient_norm', ['gradient_norm'], {},
+                                      {'batch': batch, 'losses': {'loss': torch.tensor(1.0)}})
+        with patch('utils.pretrain_record.torch.save', side_effect=RuntimeError('disk write failed')):
+            with self.assertRaisesRegex(RuntimeError, 'disk write failed'):
+                self.run_simulated_loop(Mock(side_effect=AmpSkippedUpdate(error, 2.0, 1.0)), Mock())
+        state = self.read_json('run.json')
+        self.assertEqual(state['status'], 'failed')
+        self.assertEqual(state['skipped_iterations'], 0)
 
     def test_failure_snapshot_write_error_is_fatal_not_skipped(self):
         batch = SimpleNamespace(to_dict=lambda: {'mol_id': torch.tensor([7])})

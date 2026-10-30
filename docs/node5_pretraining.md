@@ -174,6 +174,9 @@ or independent generated-molecule evaluation. The latter remains separate work.
 
 ## Guarded continuation from the healthy best
 
+This section records the initial strict-stop policy. The approved AMP-aware
+policy below supersedes its stop-on-any-bad-gradient behavior.
+
 The October 30 continuation uses the stopped batch16 run's `best.pt` at
 iteration 723550, not its contaminated last checkpoint or the 868260 checkpoint
 whose validation losses were nonfinite. The source directory is
@@ -263,3 +266,74 @@ git diff --cached --stat
 git commit -m "Guard nonfinite training and resume batch16 with explicit GPU sharing"
 git push gitee mdrl-reproduction
 ```
+
+## AMP-aware continuation from iteration 725000
+
+The strict continuation stopped at 728339 on node4. Its recorded loss was
+1.0317484140396118, gradient norm was NaN, and AMP scale was 2048. Inspection
+of its diagnostic snapshot found no nonfinite model or optimizer values.
+This is evidence of an abnormal backward pass, not proof of permanent weight
+corruption or the cause of the old runs' persistent NaN losses.
+
+After approval, keep the same learning rate, AMP parameters, batch16, split,
+validation schedule and checkpoint selection. Only the stop policy changes:
+
+- Nonfinite training or validation losses still stop and preserve a fatal snapshot.
+- For a nonfinite gradient norm, call the existing GradScaler step/update. A
+  temporary guard refuses any actual optimizer step, so AMP must skip the update
+  itself. Continue only if the update was skipped and the scale became smaller
+  while remaining finite and positive. Restore the original optimizer step in
+  all cases. Do not reset the scale manually or change its growth/backoff settings.
+- An unhandled bad gradient, a scaler error, or a zero/nonfinite scale stops.
+  The scale is also checked after normal updates.
+- Other original training RuntimeErrors retain their recorded-skip policy.
+
+Every confirmed AMP skip is written to `amp_events.jsonl`, with step, finite
+losses, scale before/after, and `optimizer_step_skipped: true`. The first such
+event in each segment also saves `diagnostics/first_amp_skip.json` and `.pt`,
+including the original batch/RNG and post-scaler-update state. Gradients are
+captured after clipping, as labeled. These files cannot be used for resume and
+never update best/last. Later AMP skips append small records without replacing
+the first snapshot. A later fatal anomaly can separately save `first_failure`.
+There can therefore be two diagnostic PT files in addition to the regular
+checkpoint limit; snapshots are not produced on every AMP skip.
+
+`amp_skipped_updates` is independent of `skipped_iterations` (RuntimeErrors).
+Its checkpointed count is tracked from `amp_tracking_start_iteration`; older
+unrecorded AMP skips are unknown, not assumed zero. For the legacy 725000 source,
+tracking starts at 725001. `completed_train_calls` still includes confirmed AMP
+skips, so it is not a count of actual parameter updates. An AMP-handled skip alone
+does not set failed/completed_with_skips; the inherited historical RuntimeError
+skip still causes completed_with_skips and the existing PBS exit-2 policy.
+
+Resume from the strict segment's `last.pt` at 725000, not its diagnostic snapshot.
+The generator checks the real checkpoint for finite state and matching settings;
+inherit best723550 and start at 725001. Keep the old segment and all its records.
+Node4/8 slots below follow the user's last placement and remain editable.
+
+```bash
+(
+set -euo pipefail
+BASE=/home/zhuenqiang_1/Student_Project/zms
+PY=/home/zhuenqiang_1/.conda/envs/MDRL/bin/python
+cd "$BASE/project/MDRL"
+git pull --ff-only origin mdrl-reproduction
+SOURCE="$BASE/experiment_data/mdrl/pretrain/mdrl-b16-guarded-20261030T104245Z/training/config_20261030_184359/checkpoints/last.pt"
+RUN_ID="mdrl-b16-amp-resume-$(date -u +%Y%m%dT%H%M%SZ)"
+RUN="$BASE/experiment_data/mdrl/pretrain/$RUN_ID"
+"$PY" -B scripts/prepare_pretrain_pbs.py \
+    --run-id "$RUN_ID" --resume "$SOURCE" --allow-shared-gpu \
+    --queue gentai --resources 'nodes=node4:ppn=8,walltime=300:00:00'
+bash -n "$RUN/job.pbs"
+cat "$RUN/protocol.json"
+printf '\nSubmission command (not executed):\nqsub %q\n' "$RUN/job.pbs"
+)
+```
+
+All 93 local CPU tests passed, including the actual train body using a real
+CPU GradScaler: a NaN-gradient update is skipped, scale halves, then the next
+finite update succeeds with the original optimizer/scheduler. A norm overflow
+not detected by AMP is blocked before Adam. Tests also cover recording, fatal
+stops and inherited counters. This uses local PyTorch 2.8 CPU support; the code
+uses the server's existing GradScaler API and Python 3.8 syntax, but server
+PyTorch 1.10.1/CUDA execution and the original NaN cause are not reproduced locally.

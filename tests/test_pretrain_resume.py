@@ -88,6 +88,45 @@ class PretrainResumeTests(unittest.TestCase):
         self.assertEqual(find_resume_best(child / 'checkpoints/last.pt', saved),
                          str(child / 'checkpoints/last.pt'))
 
+    def test_amp_skip_counter_roundtrips_without_changing_runtime_skip_count(self):
+        path = self.save_parent()
+        checkpoint = load_checkpoint(path)
+        checkpoint.update(amp_skipped_updates=3, amp_tracking_start_iteration=4)
+        torch.save(checkpoint, path)
+        checkpoint = load_resume_checkpoint(path, self.config)
+        child = self.new_run('amp-child')
+        with PretrainRecord(str(child), {}) as record:
+            record.resume_from(checkpoint, path, find_resume_best(path, checkpoint))
+            self.assertEqual(record.state['amp_skipped_updates'], 3)
+            self.assertEqual(record.state['amp_tracking_start_iteration'], 4)
+            self.assertEqual(record.state['skipped_iterations'], 1)
+            record.save_checkpoint(self.checkpoint(11), keep_periodic=False)
+        saved = load_resume_checkpoint(child / 'checkpoints/last.pt', self.config)
+        self.assertEqual(saved['amp_skipped_updates'], 3)
+        self.assertEqual(saved['amp_tracking_start_iteration'], 4)
+
+    def test_legacy_checkpoint_has_unknown_earlier_amp_history(self):
+        path = self.save_parent()
+        checkpoint = load_checkpoint(path)
+        checkpoint.pop('amp_skipped_updates')
+        checkpoint.pop('amp_tracking_start_iteration')
+        torch.save(checkpoint, path)
+        checkpoint = load_resume_checkpoint(path, self.config)
+        child = self.new_run('legacy-child')
+        with PretrainRecord(str(child), {}) as record:
+            record.resume_from(checkpoint, path, find_resume_best(path, checkpoint))
+            self.assertEqual(record.state['amp_skipped_updates'], 0)
+            self.assertEqual(record.state['amp_tracking_start_iteration'], 11)
+
+    def test_invalid_amp_history_counters_are_rejected(self):
+        path = self.save_parent()
+        original = load_checkpoint(path)
+        for key, value in (('amp_skipped_updates', -1), ('amp_tracking_start_iteration', 12)):
+            checkpoint = dict(original, **{key: value})
+            torch.save(checkpoint, path)
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                load_resume_checkpoint(path, self.config)
+
     def test_missing_or_newer_best_is_not_silently_relabelled(self):
         path = self.save_parent()
         checkpoint = load_resume_checkpoint(path, self.config)

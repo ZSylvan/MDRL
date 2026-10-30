@@ -108,7 +108,8 @@ if len(paths) != 1:
     raise RuntimeError('Expected exactly one recorded training segment')
 state = json.loads(paths[0].read_text())
 print('training_status=', state['status'], 'iteration=', state['iteration'],
-      'skipped_iterations=', state['skipped_iterations'])
+      'skipped_iterations=', state['skipped_iterations'],
+      'amp_skipped_updates=', state.get('amp_skipped_updates'))
 sys.exit(0 if state['status'] == 'completed' and state['skipped_iterations'] == 0 else 2)
 PY
 '''
@@ -176,10 +177,16 @@ def main():
         'best_rule': 'lowest finite validation total loss; first occurrence on ties',
         'scheduler_note': 'Original validation-driven scheduler; called only at the new validation cadence',
         'milestone_note': 'Non-validation milestone does not affect best or scheduler',
-        'training_error_policy': 'Nonfinite losses or gradient norms stop before further updates; '
+        'training_error_policy': 'Nonfinite losses stop; nonfinite gradient norms continue only '
+                                 'after AMP skips the optimizer update and reduces its scale; '
+                                 'unhandled gradients or invalid AMP scale stop; '
                                  'other original RuntimeErrors are recorded/skipped; '
                                  'any skip is not a clean completion',
         'numerical_failure_artifacts': ['diagnostics/first_failure.json', 'diagnostics/first_failure.pt'],
+        'amp_skip_artifacts': ['amp_events.jsonl', 'diagnostics/first_amp_skip.json',
+                               'diagnostics/first_amp_skip.pt'],
+        'amp_history_note': 'AMP skip counts start with this instrumentation; older unrecorded '
+                            'AMP skips are unknown and remain separate from RuntimeError skips',
         'numerical_failure_note': 'A stop records an observed nonfinite value; '
                                   'it does not by itself prove permanent weight corruption or its cause',
     })

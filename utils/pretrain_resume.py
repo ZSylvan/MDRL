@@ -45,6 +45,13 @@ def load_resume_checkpoint(path, config):
     for key in ('completed_train_calls', 'skipped_iterations'):
         if type(checkpoint[key]) is not int or checkpoint[key] < 0:
             raise ValueError('Invalid resume counter: ' + key)
+    if ('amp_skipped_updates' in checkpoint and
+            (type(checkpoint['amp_skipped_updates']) is not int or checkpoint['amp_skipped_updates'] < 0)):
+        raise ValueError('Invalid resume counter: amp_skipped_updates')
+    if ('amp_tracking_start_iteration' in checkpoint and
+            (type(checkpoint['amp_tracking_start_iteration']) is not int or
+             not 1 <= checkpoint['amp_tracking_start_iteration'] <= iteration + 1)):
+        raise ValueError('Invalid AMP tracking start iteration')
     saved = copy.deepcopy(checkpoint['config'])
     current = copy.deepcopy(config)
     for candidate in (saved, current):
