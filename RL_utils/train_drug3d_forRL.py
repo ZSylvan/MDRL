@@ -1,15 +1,18 @@
 import sys
 import os
 import shutil
-import argparse
+import random
+from types import SimpleNamespace
 sys.path.append('.')
 import time
 
 from tqdm import tqdm
 import torch
+import numpy as np
 torch.multiprocessing.set_sharing_strategy('file_system')
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import random_split
+import distutils.version
 import torch.utils.tensorboard
 from torch_geometric.loader import DataLoader
 
@@ -18,20 +21,25 @@ from RL_utils.dataset_forRL import get_dataset
 from utils.transforms import FeaturizeMol, Compose
 from utils.misc import *
 from utils.train import *
+from RL_utils.task_config import append_record
+from utils.pretrain_checks import (
+    NonfiniteTrainingError, cpu_tree, handle_amp_gradient,
+    require_amp_scale, require_finite, validate_resume_numerics,
+)
 
-def train_forRL(root, epoch_now, model_ckpt):
 
-    # root = "./RL_utils/out/1_SDF"
+def capture_training_rng(device):
+    state = dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state())
+    state['cuda'] = (dict(device=str(device), state=torch.cuda.get_rng_state(device))
+                     if torch.device(device).type == 'cuda' else None)
+    return state
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='./RL_utils/config_RL/train_MDRL_RL.yml')
-    parser.add_argument('--device', type=str, default='cuda:0')
-    parser.add_argument('--logdir', type=str, default='./RL_utils/logs/train')
-    args =parser.parse_known_args()[0]
-    # args = parser.parse_args()
+def train_forRL(root, epoch_now, model_ckpt, *, config_path, device, logdir):
+    args = SimpleNamespace(config=config_path, device=device, logdir=logdir)
 
     # Load configs
     config = load_config(args.config)
+    config.dataset.root = root
     config_name = os.path.basename(args.config)[:os.path.basename(args.config).rfind('.')]
     seed_all(config.train.seed)
 
@@ -40,8 +48,7 @@ def train_forRL(root, epoch_now, model_ckpt):
     ckpt_dir = os.path.join(log_dir, 'checkpoints')
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    logger = get_logger('train', log_dir)
-    logging.getLogger("train").disabled = True
+    logger = get_logger('train.round%d' % epoch_now, log_dir)
 
     writer = torch.utils.tensorboard.SummaryWriter(log_dir)
     # logger.info(args)
@@ -64,7 +71,12 @@ def train_forRL(root, epoch_now, model_ckpt):
     train_size = int(0.7 * len(dataset))
     val_size = len(dataset) - train_size
 
+    if not train_size or not val_size:
+        raise ValueError('The generated pool needs nonempty training and validation splits')
     train_set, val_set = random_split(dataset, [train_size, val_size])
+    append_record(os.path.join(log_dir, 'dataset.jsonl'), dict(
+        root=root, source_checkpoint=model_ckpt,
+        train_indices=train_set.indices, validation_indices=val_set.indices))
     logger.info(f"Dataset length: {len(dataset)}")
     print(f"train|Dataset length: {len(dataset)}")
     if len(dataset) == 0:
@@ -101,10 +113,37 @@ def train_forRL(root, epoch_now, model_ckpt):
     optimizer = get_optimizer(config.train.optimizer, model)
     scheduler = get_scheduler(config.train.scheduler, optimizer)
     scaler = torch.cuda.amp.GradScaler(enabled=config.train.use_amp)
+    current = {}
+    amp_skipped_updates = 0
+
+    def training_state(it):
+        return dict(config=config, model=model.state_dict(), optimizer=optimizer.state_dict(),
+                    scheduler=scheduler.state_dict(), scaler=scaler.state_dict(), iteration=it,
+                    round=epoch_now, source_checkpoint=model_ckpt, dataset_root=root,
+                    amp_skipped_updates=amp_skipped_updates, rng_state=capture_training_rng(args.device))
+
+    def record_failure(exc, it):
+        directory = os.path.join(log_dir, 'diagnostics')
+        os.makedirs(directory, exist_ok=True)
+        filename = os.path.join(directory, 'first_failure.pt')
+        if not os.path.exists(filename):
+            state = training_state(it)
+            state.update(diagnostic_only=True, error=repr(exc), context=current,
+                         stage=getattr(exc, 'stage', current.get('phase')),
+                         values=getattr(exc, 'values', {}),
+                         gradients={name: parameter.grad for name, parameter in model.named_parameters()
+                                    if parameter.grad is not None})
+            torch.save(cpu_tree(state), filename)
+        append_record(os.path.join(log_dir, 'failures.jsonl'), dict(
+            round=epoch_now, iteration=it, error=repr(exc), snapshot=filename))
 
     def train(it):
+        nonlocal amp_skipped_updates
         optimizer.zero_grad(set_to_none=True)
         batch = next(train_iterator).to(args.device)
+        current.clear()
+        current.update(phase='train', iteration=it, batch=batch.to_dict(), rng_before_loss=capture_training_rng(args.device))
+        require_amp_scale(scaler, current)
         
         pos_noise = torch.randn_like(batch.node_pos) * config.train.pos_noise_std
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=config.train.use_amp):
@@ -119,11 +158,23 @@ def train_forRL(root, epoch_now, model_ckpt):
                 num_mol = batch.num_graphs,
             )
         loss = loss_dict['loss']
+        current['losses'] = loss_dict
+        require_finite('train_loss', loss_dict, current)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         orig_grad_norm = clip_grad_norm_(model.parameters(), config.train.max_grad_norm)
+        try:
+            require_finite('train_gradient_norm', {'gradient_norm': orig_grad_norm}, current)
+        except NonfiniteTrainingError as exc:
+            skipped = handle_amp_gradient(exc, scaler, optimizer)
+            amp_skipped_updates += 1
+            append_record(os.path.join(log_dir, 'amp_skips.jsonl'), dict(
+                iteration=it, scale_before=skipped.scale_before, scale_after=skipped.scale_after))
+            logger.warning('AMP skipped update %d: %s -> %s', it, skipped.scale_before, skipped.scale_after)
+            return
         scaler.step(optimizer)
         scaler.update()
+        require_amp_scale(scaler, current)
 
         log_info = '[Train] Iter %d | ' % it + ' | '.join([
             '%s: %.6f' % (k, v.item()) for k, v in loss_dict.items()
@@ -136,6 +187,9 @@ def train_forRL(root, epoch_now, model_ckpt):
         writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], it)
         writer.add_scalar('train/grad', orig_grad_norm, it)
         writer.flush()
+        append_record(os.path.join(log_dir, 'train.jsonl'), dict(
+            iteration=it, losses={key: value.item() for key, value in loss_dict.items()},
+            gradient_norm=orig_grad_norm.item(), lr=optimizer.param_groups[0]['lr']))
 
     def validate(it):
         sum_n =  0   # num of loss
@@ -145,6 +199,9 @@ def train_forRL(root, epoch_now, model_ckpt):
             # for batch in tqdm(val_loader, desc='Validate'):
             for batch in val_loader:
                 batch = batch.to(args.device)
+                current.clear()
+                current.update(phase='validation', iteration=it, batch_index=sum_n,
+                               batch=batch.to_dict(), rng_before_loss=capture_training_rng(args.device))
                 with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=config.train.use_amp):
                     loss_dict = model.get_loss(
                         # compose
@@ -156,6 +213,8 @@ def train_forRL(root, epoch_now, model_ckpt):
                         batch_halfedge = batch.halfedge_type_batch,
                         num_mol = batch.num_graphs,
                     )
+                current['losses'] = loss_dict
+                require_finite('validation_loss', loss_dict, current)
                 if len(sum_loss_dict) == 0:
                     sum_loss_dict = {k: v.item() for k, v in loss_dict.items()}
                 else:
@@ -182,6 +241,7 @@ def train_forRL(root, epoch_now, model_ckpt):
         for k, v in avg_loss_dict.items():
             writer.add_scalar('val/%s' % k, v, it)
         writer.flush()
+        append_record(os.path.join(log_dir, 'validation.jsonl'), dict(iteration=it, losses=avg_loss_dict))
         return avg_loss
 
     try:
@@ -191,25 +251,33 @@ def train_forRL(root, epoch_now, model_ckpt):
         for it in range(1, config.train.max_iters+1):
             try:
                 train(it)
-            except RuntimeError as e:
-                logger.error('Runtime Error ' + str(e))
-                logger.error('Skipping Iteration %d' % it)
-                print('train|Runtime Error ' + str(e))
-                print('train|Skipping Iteration %d' % it)
-            if it % config.train.val_freq == 0 or it == config.train.max_iters:
-                validate(it)
-                ckpt_path = os.path.join(ckpt_dir, 'epoch%d_it%d.pt' % (epoch_now, it))
-                torch.save({
-                    'config': config,
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'iteration': it,
-                }, ckpt_path)
-                model.train()
+                if it % config.train.val_freq == 0 or it == config.train.max_iters:
+                    validation_loss = validate(it)
+                    ckpt_path = os.path.join(ckpt_dir, 'epoch%d_it%d.pt' % (epoch_now, it))
+                    state = training_state(it)
+                    state['validation_loss'] = validation_loss
+                    validate_resume_numerics(state)
+                    temporary = ckpt_path + '.tmp'
+                    torch.save(state, temporary)
+                    os.replace(temporary, ckpt_path)
+                    model.train()
+            except Exception as exc:
+                try:
+                    record_failure(exc, it)
+                except Exception:
+                    logger.exception('Could not save failure diagnostics; original error: %r', exc)
+                raise
         now = time.localtime()
         print(time.strftime("%Y-%m-%d %H:%M:%S", now))
         return ckpt_path
     except KeyboardInterrupt:
         logger.info('Terminating...')                    
-        print('train|Terminating...')    
+        print('train|Terminating...')
+        raise
+    finally:
+        writer.close()
+        if dataset.db is not None:
+            dataset._close_db()
+        for handler in list(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)

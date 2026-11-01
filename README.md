@@ -70,10 +70,17 @@ You can use `./RL_utils/ligand_binding_model/xgboost/xgbr_bindingdb.ipynb` to tr
 
 ### Reinforcement learning
 
-First, use `./RL_utils/scoring_definition.csv` to construct the scoring target, including ligand efficiency, SA, QED, LogP, and MW. An example is given in the file.
+Select a task YAML under `RL_utils/config_RL/tasks/` and configure its checkpoint,
+receptors, scoring models, docking boxes, output directory and CPU/GPU settings.
+The entry constructs the scoring CSV from that task. Each task uses the native
+MDRL population-based fine-tuning method, not a FlowMol SFT/NFT workflow.
 
 Then, you can run the reinforcement learning using following command:
 ```python
-python RL_utils/01_RL.py
+python -B RL_utils/01_RL.py --config RL_utils/config_RL/tasks/chk1_auroraa.yml
 ```
+
+Use `--check-config` for an input/configuration check without loading models or
+starting sampling, training or docking. See [dual-target fine-tuning](docs/dual_target_finetuning.md)
+for all three tasks, parallel-scoring settings, saved results and remaining limits.
 

@@ -1,126 +1,77 @@
-import os
-import subprocess
-from openbabel import openbabel
-from rdkit import Chem
+"""Serial docking with task-supplied targets and a separate log per molecule."""
+
+import math
+from pathlib import Path
 import re
-import numpy as np
-
-class GaussianModifier:
-
-    def __init__(self, mu: float, sigma: float) -> None:
-        self.mu = mu
-        self.sigma = sigma
-
-    def __call__(self, x):
-        return np.exp(-0.5 * np.power((x - self.mu) / self.sigma, 2.))
-
-
-class MinMaxGaussianModifier:
-
-    def __init__(self, mu: float, sigma: float, minimize=False) -> None:
-        self.mu = mu
-        self.sigma = sigma
-        self.minimize = minimize
-        self._full_gaussian = GaussianModifier(mu=mu, sigma=sigma)
-
-    def __call__(self, x):
-        if self.minimize:
-            mod_x = np.maximum(x, self.mu)
-        else:
-            mod_x = np.minimum(x, self.mu)
-        return self._full_gaussian(mod_x)
+import subprocess
 
 
 def sdf_to_pdbqt(input_sdf, output_pdbqt):
+    from openbabel import openbabel
 
-    
-    obConversion = openbabel.OBConversion()
-    obConversion.SetInAndOutFormats("sdf", "pdbqt")
-    mol = openbabel.OBMol()
-    obConversion.ReadFile(mol, input_sdf)
+    conversion = openbabel.OBConversion()
+    if not conversion.SetInAndOutFormats('sdf', 'pdbqt'):
+        raise RuntimeError('OpenBabel SDF/PDBQT format plugins are unavailable')
+    molecule = openbabel.OBMol()
+    if not conversion.ReadFile(molecule, str(input_sdf)):
+        raise RuntimeError('OpenBabel could not read ' + str(input_sdf))
+    molecule.AddHydrogens()
+    charge_model = openbabel.OBChargeModel.FindType('gasteiger')
+    if charge_model is None or not charge_model.ComputeCharges(molecule):
+        raise RuntimeError('OpenBabel Gasteiger charge assignment failed')
+    if not conversion.WriteFile(molecule, str(output_pdbqt)):
+        raise RuntimeError('OpenBabel could not write ' + str(output_pdbqt))
+    conversion.CloseOutFile()
 
-    mol.AddHydrogens()  
-    openbabel.OBChargeModel.FindType("gasteiger").ComputeCharges(mol)
 
-    obConversion.WriteFile(mol, output_pdbqt)
+def parse_affinity(output):
+    match = re.search(r'^\s*1\s+([-+]?\d+(?:\.\d+)?)\s+', output, re.MULTILINE)
+    if match is None:
+        raise ValueError('Vina output contains no mode-1 affinity')
+    affinity = float(match.group(1))
+    if not math.isfinite(affinity):
+        raise ValueError('Nonfinite docking affinity')
+    return affinity
 
 
-def run_docking_and_normalize(ligand_sdf_path, receptor_pdbqt_path, center, box_size, mu, sigma, minimize=False):
+def normalize_affinity(affinity, parameters):
+    mu, sigma = parameters['mu'], parameters['sigma']
+    clipped = max(affinity, mu) if parameters['minimize'] else min(affinity, mu)
+    return math.exp(-0.5 * ((clipped - mu) / sigma) ** 2)
 
-    ligand_pdbqt_path = ligand_sdf_path.replace('.sdf', '.pdbqt')
-    sdf_to_pdbqt(ligand_sdf_path, ligand_pdbqt_path)
 
-    vina_command = [
-        'vina', 
-        '--receptor', receptor_pdbqt_path,  
-        '--ligand', ligand_pdbqt_path, 
-        '--center_x', str(center[0]), '--center_y', str(center[1]), '--center_z', str(center[2]),  
-        '--size_x', str(box_size[0]), '--size_y', str(box_size[1]), '--size_z', str(box_size[2]),  
-        '--exhaustiveness', '8', 
-        '--num_modes', '1' 
-    ]
-
-    result = subprocess.run(
-        vina_command,
-        stdout=subprocess.PIPE,  
-        stderr=subprocess.PIPE   
-    )
-
-    output = result.stdout.decode('utf-8')
-
-    match = re.search(r'\d+\s+(-\d+\.\d+)\s+', output)
-    if match:
-        best_score = float(match.group(1))
-
-        modifier = MinMaxGaussianModifier(mu=mu, sigma=sigma, minimize=minimize)
-        normalized_score = modifier(best_score)
-        # normalized_score = modifier(-5)
-        # return normalized_score
-        return normalized_score, output  
-    else:
-        raise ValueError("No score.")
-
-def dock_socre(gen_list, dock_scores_all,i):
-    rdmol = gen_list[i]['rdmol']
-    sdf_dir = './docking_workdir/init/'
-    sdf_path = os.path.join(sdf_dir, f'{i}.sdf')
-    os.makedirs(sdf_dir, exist_ok=True)
-    Chem.MolToMolFile(rdmol, sdf_path)
+def run_vina(ligand, target, settings, logfile):
+    command = [settings['executable'], '--receptor', target['receptor'], '--ligand', str(ligand)]
+    for axis, center, size in zip('xyz', target['center'], target['box_size']):
+        command.extend(['--center_' + axis, str(center), '--size_' + axis, str(size)])
+    command.extend(['--exhaustiveness', str(settings['exhaustiveness']),
+                    '--num_modes', str(settings['num_modes']), '--cpu', str(settings['cpu']),
+                    '--out', str(Path(logfile).with_suffix('.pdbqt'))])
     try:
-        normalized_score_mTOR, vina_output_mTOR = run_docking_and_normalize(
-            ligand_sdf_path=sdf_path,
-            receptor_pdbqt_path="/home/yuanyn/pxh/Diff/MRDM/RL_utils/mTOR.pdbqt",
-            center=(-9.2, 26.8, 35.8),
-            box_size=(126, 126, 126),
-            mu=-9.0,
-            sigma=1.0,
-            minimize=True
-        )
+        result = subprocess.run(command, capture_output=True, text=True,
+                                timeout=settings.get('timeout'), check=False)
+    except subprocess.TimeoutExpired as exc:
+        def decoded(value):
+            return value.decode(errors='replace') if isinstance(value, bytes) else (value or '')
+        Path(logfile).write_text(decoded(exc.stdout) + '\n' + decoded(exc.stderr) + '\nTIMEOUT\n')
+        raise RuntimeError('Docking timed out for ' + target['name']) from exc
+    Path(logfile).write_text(result.stdout + '\nSTDERR:\n' + result.stderr)
+    if result.returncode:
+        raise RuntimeError('Vina failed for %s (exit %d); see %s' % (target['name'], result.returncode, logfile))
+    affinity = parse_affinity(result.stdout)
+    return dict(target=target['name'], affinity=affinity,
+                normalized_score=normalize_affinity(affinity, target['normalization']),
+                log=str(logfile))
 
-        normalized_score_MEK1, vina_output_MEK1 = run_docking_and_normalize(
-            ligand_sdf_path=sdf_path,
-            receptor_pdbqt_path="/home/yuanyn/pxh/Diff/MRDM/RL_utils/MEK1.pdbqt",
-            center=(60.7, -27.0, 12.8),
-            box_size=(126, 126, 126),
-            mu=-9.0,
-            sigma=1.0,
-            minimize=True
-        )
 
-        output_txt_path = os.path.join(sdf_dir, f'mTOR_{i}_docking_results.txt')
-        with open(output_txt_path, 'w') as f:
-            f.write(vina_output_mTOR + "\n")
-            f.write(f"Normalized docking score: {normalized_score_mTOR}\n")
+def dock_molecule(molecule, targets, directory, settings):
+    from rdkit import Chem
 
-        output_txt_path = os.path.join(sdf_dir, f'MEK1_{i}_docking_results.txt')
-        with open(output_txt_path, 'w') as f:
-            f.write(vina_output_MEK1 + "\n")
-            f.write(f"Normalized docking score: {normalized_score_MEK1}\n")
-
-    except Exception as e:
-        print(f"Error occurred while processing molecule {i}: {e}")
-
-    normalized_score = (normalized_score_mTOR + normalized_score_MEK1) / 2
-    # gen_list[i]['score'] = normalized_score
-    dock_scores_all = dock_scores_all + normalized_score
-    return normalized_score, dock_scores_all
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=False)
+    sdf = directory / 'ligand.sdf'
+    ligand = directory / 'ligand.pdbqt'
+    Chem.MolToMolFile(molecule, str(sdf))
+    sdf_to_pdbqt(sdf, ligand)
+    return [run_vina(ligand, target, settings, directory / (target['name'] + '.log'))
+            for target in targets]

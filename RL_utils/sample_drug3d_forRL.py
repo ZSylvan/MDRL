@@ -1,11 +1,12 @@
 import os
 import sys
 import shutil
-import argparse
+from types import SimpleNamespace
 sys.path.append('.')
 
 import torch
 import numpy as np
+import distutils.version
 import torch.utils.tensorboard
 from easydict import EasyDict
 from rdkit import Chem
@@ -17,6 +18,7 @@ from utils.sample import seperate_outputs
 from utils.transforms import *
 from utils.misc import *
 from utils.reconstruct import *
+from RL_utils.task_config import append_record
 
 def print_pool_status(pool, logger):
     logger.info('[Pool] Finished %d | Failed %d' % (
@@ -36,14 +38,9 @@ def data_exists(data, prevs):
                 return True
     return False
 
-def sample(model_ckpt, num_mols, epoch_now):
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='./RL_utils/config_RL/sample_MDRL_simple_RL.yml')
-    parser.add_argument('--outdir', type=str, default='./RL_utils/logs/sample')
-    parser.add_argument('--device', type=str, default='cuda:0')
-    parser.add_argument('--batch_size', type=int, default=0)
-    args =parser.parse_known_args()[0]
-    # args = parser.parse_args()
+@torch.no_grad()
+def sample(model_ckpt, num_mols, epoch_now, *, config_path, device, outdir, batch_size=0):
+    args = SimpleNamespace(config=config_path, device=device, outdir=outdir, batch_size=batch_size)
 
     # # Load configs
     config = load_config(args.config)
@@ -58,14 +55,17 @@ def sample(model_ckpt, num_mols, epoch_now):
     log_dir = get_new_log_dir(log_root, prefix=config_name, tag='epoch%d' % epoch_now)
 
 
-    logger = get_logger('sample', log_dir)
-    logging.getLogger("sample").disabled = True
+    logger = get_logger('sample.round%d' % epoch_now, log_dir)
 
 
     writer = torch.utils.tensorboard.SummaryWriter(log_dir)
     # logger.info(args)
     # logger.info(config)
     shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
+    append_record(os.path.join(log_dir, 'sampling.jsonl'), dict(
+        checkpoint=model_ckpt, round=epoch_now, requested=num_mols,
+        seed=int(config.sample.seed + np.sum([ord(s) for s in args.outdir])),
+        batch_size=args.batch_size if args.batch_size > 0 else config.sample.batch_size))
 
     # # Transform
     logger.info('Loading data placeholder...')
@@ -142,8 +142,10 @@ def sample(model_ckpt, num_mols, epoch_now):
         batch_node, halfedge_index, batch_halfedge = batch_node.cpu().numpy(), halfedge_index.cpu().numpy(), batch_halfedge.cpu().numpy()
         try:
             output_list = seperate_outputs(outputs, n_graphs, batch_node, halfedge_index, batch_halfedge)
-        except:
-            continue
+        except Exception as exc:
+            raise RuntimeError('Could not separate sampled graphs') from exc
+        if not output_list:
+            raise RuntimeError('Sampling returned an empty graph batch')
         gen_list = []
         for i_mol, output_mol in enumerate(output_list):
             mol_info = featurizer.decode_output(
@@ -189,6 +191,9 @@ def sample(model_ckpt, num_mols, epoch_now):
 
     now = time.localtime()
     print(time.strftime("%Y-%m-%d %H:%M:%S", now))
+    writer.close()
+    for handler in list(logger.handlers):
+        handler.close()
+        logger.removeHandler(handler)
     return gen_list_all
     # torch.save(pool, os.path.join(log_dir, 'samples_all.pt'))
-    

@@ -1,0 +1,41 @@
+name: chk1-auroraa
+seed: 2023
+device: cuda:0
+initial_checkpoint: /home/zhuenqiang_1/Student_Project/zms/experiment_data/mdrl/pretrain/mdrl-b16-amp-resume-20261030T141531Z/training/config_20261030_224031/checkpoints/last.pt
+expected_pretrain_iteration: 985000
+output_dir: /home/zhuenqiang_1/Student_Project/zms/experiment_data/mdrl/finetune/chk1-auroraa
+train_config: ../train_MDRL_RL.yml
+sample_config: ../sample_MDRL_simple_RL.yml
+fscores: ../../fpscores.pkl.gz
+train_overrides: {batch_size: 24, num_workers: 9}
+sample_overrides: {batch_size: 512}
+rl:
+  n_epochs: 50  # Original loop: initial population plus 49 update rounds.
+  initial_num_mols: 3000
+  new_num_mols_per_epoch: 2000
+  top_k: 4000
+scoring:
+  predictor_threads: 1
+  qed: {mu: 0.75, sigma: 0.1, minimize: false}
+  sa: {mu: 3.0, sigma: 0.5, minimize: true}
+  ligand_efficiency: {mu: 0.8, sigma: 0.3, minimize: false}
+docking:
+  workers: 4
+  executable: /home/zhuenqiang_1/.conda/envs/MDRL/bin/vina
+  cpu: 1
+  timeout: null
+  exhaustiveness: 8
+  num_modes: 1
+targets:
+  - name: CHK1
+    receptor: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/targets/target_pair_00004/CHK1_protein.pdbqt
+    ligand_model: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/xgboost/O14757_xgbr_ligand_model.pkl
+    center: [13.4734, -4.2531, 14.1905]
+    box_size: [126, 126, 126]
+    normalization: {mu: -9.0, sigma: 1.0, minimize: true}
+  - name: AuroraA
+    receptor: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/targets/target_pair_00004/AuroraA_protein.pdbqt
+    ligand_model: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/xgboost/O14965_xgbr_ligand_model.pkl
+    center: [-11.9662, -25.4919, 7.1844]
+    box_size: [126, 126, 126]
+    normalization: {mu: -9.0, sigma: 1.0, minimize: true}

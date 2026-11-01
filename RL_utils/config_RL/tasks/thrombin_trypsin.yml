@@ -1,0 +1,41 @@
+name: thrombin-trypsin
+seed: 2023
+device: cuda:0
+initial_checkpoint: /home/zhuenqiang_1/Student_Project/zms/experiment_data/mdrl/pretrain/mdrl-b16-amp-resume-20261030T141531Z/training/config_20261030_224031/checkpoints/last.pt
+expected_pretrain_iteration: 985000
+output_dir: /home/zhuenqiang_1/Student_Project/zms/experiment_data/mdrl/finetune/thrombin-trypsin
+train_config: ../train_MDRL_RL.yml
+sample_config: ../sample_MDRL_simple_RL.yml
+fscores: ../../fpscores.pkl.gz
+train_overrides: {batch_size: 24, num_workers: 9}
+sample_overrides: {batch_size: 512}
+rl:
+  n_epochs: 50  # Original loop: initial population plus 49 update rounds.
+  initial_num_mols: 3000
+  new_num_mols_per_epoch: 2000
+  top_k: 4000
+scoring:
+  predictor_threads: 1
+  qed: {mu: 0.75, sigma: 0.1, minimize: false}
+  sa: {mu: 3.0, sigma: 0.5, minimize: true}
+  ligand_efficiency: {mu: 0.8, sigma: 0.3, minimize: false}
+docking:
+  workers: 4
+  executable: /home/zhuenqiang_1/.conda/envs/MDRL/bin/vina
+  cpu: 1
+  timeout: null
+  exhaustiveness: 8
+  num_modes: 1
+targets:
+  - name: Thrombin
+    receptor: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/targets/target_pair_00002/Thrombin_protein.pdbqt
+    ligand_model: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/xgboost/P00734_xgbr_ligand_model.pkl
+    center: [15.9111, -11.219, 19.8419]
+    box_size: [126, 126, 126]
+    normalization: {mu: -9.0, sigma: 1.0, minimize: true}
+  - name: Trypsin
+    receptor: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/targets/target_pair_00002/Trypsin_protein.pdbqt
+    ligand_model: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/xgboost/P00760_xgbr_ligand_model.pkl
+    center: [-1.407, 5.4888, 20.7089]
+    box_size: [126, 126, 126]
+    normalization: {mu: -9.0, sigma: 1.0, minimize: true}
