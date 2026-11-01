@@ -25,6 +25,8 @@ class RLPBSTests(unittest.TestCase):
         self.assertIn('#PBS -l nodes=node4:ppn=7,walltime=720:00:00', source)
         self.assertIn('export CUDA_VISIBLE_DEVICES=1', source)
         self.assertIn('RL_utils/01_RL.py --config "$JOB_DIR/task.yml"', source)
+        self.assertIn('--resume-if-exists', source)
+        self.assertIn('exec >> "$JOB_DIR/launcher.log" 2>&1', source)
         self.assertIn('ENV_ROOT=/home/zhuenqiang_1/.conda/envs/MDRL', source)
         self.assertNotIn('nvidia-smi', source)
         self.assertNotIn('expected node', source)

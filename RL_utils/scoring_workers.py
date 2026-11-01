@@ -6,6 +6,7 @@ import multiprocessing
 import os
 
 from RL_utils.task_config import append_record
+from RL_utils.run_state import read_records
 
 
 _CONFIG = None
@@ -58,10 +59,22 @@ def create_pool(config, scoring_csv):
                                initializer=initialize_worker, initargs=(config, str(scoring_csv)))
 
 
-def score_population(population, pool, workers, round_dir):
-    iterator = iter(enumerate(population))
+def score_population(population, pool, workers, round_dir, resume=False):
+    cached = {}
+    if resume:
+        for record in read_records(round_dir / 'scores.jsonl'):
+            index = record['molecule_index']
+            if (type(index) is not int or not 0 <= index < len(population) or index in cached or
+                    record['smiles'] != population[index]['smiles'] or
+                    not math.isfinite(record['reward'])):
+                raise ValueError('Saved scoring records do not match this population')
+            cached[index] = record['reward']
+            population[index]['score'] = record['reward']
+    elif (round_dir / 'scores.jsonl').exists():
+        raise FileExistsError('Scoring records already exist; use --resume')
+    iterator = iter((index, molecule) for index, molecule in enumerate(population) if index not in cached)
     pending = {}
-    completed = 0
+    completed = len(cached)
 
     def submit_one():
         item = next(iterator, None)

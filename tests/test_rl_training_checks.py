@@ -38,7 +38,11 @@ class RLTrainingChecksTests(unittest.TestCase):
             config['initial_checkpoint'] = str(checkpoint)
             sampling = Mock(side_effect=lambda path, count, epoch, **kw:
                             [dict(smiles='%d-%d' % (epoch, i), rdmol=None) for i in range(count)])
-            trainer = Mock(side_effect=lambda root, epoch, path, **kw: str(directory / ('round%d.pt' % epoch)))
+            def train(root, epoch, path, **kw):
+                checkpoint = directory / ('round%d.pt' % epoch)
+                torch.save(dict(model=dict(weight=torch.tensor([1.0]))), checkpoint)
+                return str(checkpoint)
+            trainer = Mock(side_effect=train)
             pool = Mock()
 
             def score(population, pool, workers, path):
@@ -48,6 +52,8 @@ class RLTrainingChecksTests(unittest.TestCase):
 
             def save(population, path):
                 path.mkdir()
+                torch.save(population, path / 'population.pt')
+                (path / 'manifest.json').write_text(json.dumps(dict(count=len(population))))
 
             modules = {
                 'RL_utils.sample_drug3d_forRL': SimpleNamespace(sample=sampling),
@@ -62,11 +68,23 @@ class RLTrainingChecksTests(unittest.TestCase):
             self.assertTrue(pinned.is_file())
             self.assertEqual(sampling.call_args_list[0].args[0], str(pinned))
             self.assertEqual(trainer.call_args_list[0].args[2], str(pinned))
-            self.assertEqual(sampling.call_args_list[1].args[0], str(directory / 'round1.pt'))
-            self.assertEqual(trainer.call_args_list[1].args[2], str(directory / 'round1.pt'))
+            first_final = directory / 'output/round_001/checkpoints/final.pt'
+            self.assertEqual(sampling.call_args_list[1].args[0], str(first_final))
+            self.assertEqual(trainer.call_args_list[1].args[2], str(first_final))
             rounds = [json.loads(line) for line in (directory / 'output/rounds.jsonl').read_text().splitlines()]
             self.assertEqual([item['selected'] for item in rounds], [3, 4, 4])
+            self.assertEqual([item.get('training_population_count') for item in rounds], [None, 3, 4])
+            for epoch, count in ((0, 3), (1, 2), (2, 2)):
+                path = directory / ('output/round_%03d/generated/manifest.json' % epoch)
+                self.assertEqual(json.loads(path.read_text())['count'], count)
+            self.assertTrue((directory / 'output/round_002/checkpoints/final.pt').is_file())
             pool.shutdown.assert_called_once_with(wait=True)
+            sampling.reset_mock()
+            trainer.reset_mock()
+            with patch.dict('sys.modules', modules):
+                entry.run(config, source, resume=True)
+            sampling.assert_not_called()
+            trainer.assert_not_called()
             with self.assertRaises(FileExistsError):
                 with patch.dict('sys.modules', modules):
                     entry.run(config, source)

@@ -1,7 +1,6 @@
 import sys
 import os
 import shutil
-import random
 from types import SimpleNamespace
 sys.path.append('.')
 import time
@@ -11,7 +10,7 @@ import torch
 import numpy as np
 torch.multiprocessing.set_sharing_strategy('file_system')
 from torch.nn.utils import clip_grad_norm_
-from torch.utils.data import random_split
+from torch.utils.data import random_split, Subset
 import distutils.version
 import torch.utils.tensorboard
 from torch_geometric.loader import DataLoader
@@ -22,6 +21,9 @@ from utils.transforms import FeaturizeMol, Compose
 from utils.misc import *
 from utils.train import *
 from RL_utils.task_config import append_record
+from RL_utils.run_state import (
+    capture_rng, load_state, restore_training_components, save_state, validate_round_checkpoint,
+)
 from utils.pretrain_checks import (
     NonfiniteTrainingError, cpu_tree, handle_amp_gradient,
     require_amp_scale, require_finite, validate_resume_numerics,
@@ -29,12 +31,9 @@ from utils.pretrain_checks import (
 
 
 def capture_training_rng(device):
-    state = dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state())
-    state['cuda'] = (dict(device=str(device), state=torch.cuda.get_rng_state(device))
-                     if torch.device(device).type == 'cuda' else None)
-    return state
+    return capture_rng(device)
 
-def train_forRL(root, epoch_now, model_ckpt, *, config_path, device, logdir):
+def train_forRL(root, epoch_now, model_ckpt, *, config_path, device, logdir, resume_from=None):
     args = SimpleNamespace(config=config_path, device=device, logdir=logdir)
 
     # Load configs
@@ -42,6 +41,11 @@ def train_forRL(root, epoch_now, model_ckpt, *, config_path, device, logdir):
     config.dataset.root = root
     config_name = os.path.basename(args.config)[:os.path.basename(args.config).rfind('.')]
     seed_all(config.train.seed)
+    resumed = load_state(resume_from) if resume_from is not None else None
+    if resumed is not None:
+        validate_round_checkpoint(resumed, config, root, epoch_now, model_ckpt)
+        if resumed['iteration'] == config.train.max_iters:
+            return str(resume_from)
 
     # Logging
     log_dir = get_new_log_dir(args.logdir, prefix=config_name, tag='epoch%d' % epoch_now)
@@ -73,9 +77,18 @@ def train_forRL(root, epoch_now, model_ckpt, *, config_path, device, logdir):
 
     if not train_size or not val_size:
         raise ValueError('The generated pool needs nonempty training and validation splits')
-    train_set, val_set = random_split(dataset, [train_size, val_size])
+    if resumed is None:
+        train_set, val_set = random_split(dataset, [train_size, val_size])
+    else:
+        split = resumed['dataset_split']
+        indices = split['train_indices'] + split['validation_indices']
+        if (len(split['train_indices']) != train_size or len(split['validation_indices']) != val_size or
+                sorted(indices) != list(range(len(dataset)))):
+            raise ValueError('Saved RL train/validation split does not match the dataset')
+        train_set = Subset(dataset, split['train_indices'])
+        val_set = Subset(dataset, split['validation_indices'])
     append_record(os.path.join(log_dir, 'dataset.jsonl'), dict(
-        root=root, source_checkpoint=model_ckpt,
+        root=root, source_checkpoint=model_ckpt, resume_from=resume_from,
         train_indices=train_set.indices, validation_indices=val_set.indices))
     logger.info(f"Dataset length: {len(dataset)}")
     print(f"train|Dataset length: {len(dataset)}")
@@ -106,7 +119,7 @@ def train_forRL(root, epoch_now, model_ckpt, *, config_path, device, logdir):
     else:
         raise NotImplementedError('Model %s not implemented' % config.model.name)
     print('train|Num of trainable parameters is', np.sum([p.numel() for p in model.parameters() if p.requires_grad]))
-    ckpt = torch.load(model_ckpt, map_location=args.device)
+    ckpt = resumed if resumed is not None else load_state(model_ckpt)
     model.load_state_dict(ckpt['model'])
     
     # Optimizer and scheduler
@@ -115,11 +128,19 @@ def train_forRL(root, epoch_now, model_ckpt, *, config_path, device, logdir):
     scaler = torch.cuda.amp.GradScaler(enabled=config.train.use_amp)
     current = {}
     amp_skipped_updates = 0
+    start_iteration = 1
+    if resumed is not None:
+        restore_training_components(resumed, optimizer, scheduler, scaler, args.device)
+        amp_skipped_updates = resumed['amp_skipped_updates']
+        start_iteration = resumed['iteration'] + 1
+        logger.info('Resuming round %d from iteration %d: %s', epoch_now, start_iteration - 1, resume_from)
 
     def training_state(it):
         return dict(config=config, model=model.state_dict(), optimizer=optimizer.state_dict(),
                     scheduler=scheduler.state_dict(), scaler=scaler.state_dict(), iteration=it,
                     round=epoch_now, source_checkpoint=model_ckpt, dataset_root=root,
+                    dataset_split=dict(train_indices=train_set.indices, validation_indices=val_set.indices),
+                    data_iterator_restored=False,
                     amp_skipped_updates=amp_skipped_updates, rng_state=capture_training_rng(args.device))
 
     def record_failure(exc, it):
@@ -248,7 +269,7 @@ def train_forRL(root, epoch_now, model_ckpt, *, config_path, device, logdir):
         now = time.localtime()
         print(time.strftime("%Y-%m-%d %H:%M:%S", now))
         model.train()
-        for it in range(1, config.train.max_iters+1):
+        for it in range(start_iteration, config.train.max_iters+1):
             try:
                 train(it)
                 if it % config.train.val_freq == 0 or it == config.train.max_iters:
@@ -257,9 +278,7 @@ def train_forRL(root, epoch_now, model_ckpt, *, config_path, device, logdir):
                     state = training_state(it)
                     state['validation_loss'] = validation_loss
                     validate_resume_numerics(state)
-                    temporary = ckpt_path + '.tmp'
-                    torch.save(state, temporary)
-                    os.replace(temporary, ckpt_path)
+                    save_state(ckpt_path, state)
                     model.train()
             except Exception as exc:
                 try:

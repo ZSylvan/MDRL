@@ -68,7 +68,12 @@ def dock_molecule(molecule, targets, directory, settings):
     from rdkit import Chem
 
     directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=False)
+    directory.mkdir(parents=True, exist_ok=True)
+    attempt = 1
+    while (directory / ('attempt_%03d' % attempt)).exists():
+        attempt += 1
+    directory = directory / ('attempt_%03d' % attempt)
+    directory.mkdir()
     sdf = directory / 'ligand.sdf'
     ligand = directory / 'ligand.pdbqt'
     Chem.MolToMolFile(molecule, str(sdf))

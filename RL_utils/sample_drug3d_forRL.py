@@ -2,6 +2,7 @@ import os
 import sys
 import shutil
 from types import SimpleNamespace
+from pathlib import Path
 sys.path.append('.')
 
 import torch
@@ -19,6 +20,7 @@ from utils.transforms import *
 from utils.misc import *
 from utils.reconstruct import *
 from RL_utils.task_config import append_record
+from RL_utils.run_state import capture_rng, load_state, read_sampling_batches, restore_rng, save_state
 
 def print_pool_status(pool, logger):
     logger.info('[Pool] Finished %d | Failed %d' % (
@@ -39,16 +41,25 @@ def data_exists(data, prevs):
     return False
 
 @torch.no_grad()
-def sample(model_ckpt, num_mols, epoch_now, *, config_path, device, outdir, batch_size=0):
+def sample(model_ckpt, num_mols, epoch_now, *, config_path, device, outdir, batch_size=0, resume=False):
     args = SimpleNamespace(config=config_path, device=device, outdir=outdir, batch_size=batch_size)
 
     # # Load configs
     config = load_config(args.config)
     config_name = os.path.basename(args.config)[:os.path.basename(args.config).rfind('.')]
     seed_all(config.sample.seed + np.sum([ord(s) for s in args.outdir]))
+    journal = Path(outdir) / 'batches'
+    identity = dict(checkpoint=str(model_ckpt), requested=num_mols, round=epoch_now,
+                    config=config, batch_size=args.batch_size)
+    if (journal / 'identity.json').exists() and not resume:
+        raise FileExistsError('Sampling already exists; use --resume: ' + str(outdir))
+    finished, failed_count, saved_rng, batch_index = read_sampling_batches(journal, identity)
+    if len(finished) >= num_mols:
+        print('sample|Restored completed sampling: %d molecules' % len(finished), flush=True)
+        return finished
     # load ckpt and train config
-    ckpt = torch.load(model_ckpt, map_location=args.device)
-    train_config = ckpt['config']
+    ckpt = load_state(model_ckpt)
+    train_config = EasyDict(ckpt['config'])
 
     # # Logging
     log_root = args.outdir.replace('outputs', 'outputs_vscode') if sys.argv[0].startswith('/data') else args.outdir
@@ -93,8 +104,8 @@ def sample(model_ckpt, num_mols, epoch_now, *, config_path, device, outdir, batc
     # # Bond predictor adn guidance
     if 'bond_predictor' in config:
         logger.info('Building bond predictor...')
-        ckpt_bond = torch.load(config.bond_predictor, map_location=args.device)
-        bond_predictor = BondPredictor(ckpt_bond['config']['model'],
+        ckpt_bond = load_state(config.bond_predictor)
+        bond_predictor = BondPredictor(EasyDict(ckpt_bond['config']['model']),
                 featurizer.num_node_types,
                 featurizer.num_edge_types-1 # note: bond_predictor not use edge mask
         ).to(args.device)
@@ -109,13 +120,16 @@ def sample(model_ckpt, num_mols, epoch_now, *, config_path, device, outdir, batc
 
 
     pool = EasyDict({
-        'failed': [],
-        'finished': [],
+        'failed': [None] * failed_count,
+        'finished': finished,
     })
     # # generating molecules
     now = time.localtime()
     print(time.strftime("%Y-%m-%d %H:%M:%S", now))
-    gen_list_all = []
+    gen_list_all = list(finished)
+    if saved_rng is not None:
+        restore_rng(saved_rng, args.device)
+        logger.info('Resuming after %d saved batches, %d finished molecules', batch_index, len(finished))
     while len(pool.finished) < num_mols:
         if len(pool.failed) > 3 * (num_mols):
             logger.info('Too many failed molecules. Stop sampling.')
@@ -187,6 +201,9 @@ def sample(model_ckpt, num_mols, epoch_now, *, config_path, device, outdir, batc
 
         gen_list_all = gen_list_all + gen_list
         pool.finished.extend(gen_list)
+        save_state(journal / ('batch_%06d.pt' % batch_index), dict(
+            molecules=gen_list, failed_total=len(pool.failed), rng=capture_rng(args.device)))
+        batch_index += 1
         print_pool_status(pool, logger)
 
     now = time.localtime()

@@ -44,7 +44,7 @@ class TaskConfigTests(unittest.TestCase):
             self.assertEqual(task['sample_overrides'], dict(batch_size=512))
             self.assertEqual(task['rl'], dict(n_epochs=50, initial_num_mols=3000,
                                               new_num_mols_per_epoch=2000, top_k=4000))
-            self.assertEqual(task['docking']['workers'], 4)
+            self.assertEqual(task['docking']['workers'], 16)
             self.assertEqual(task['docking']['cpu'], 1)
             self.assertIn('/MDRL/bin/vina', task['docking']['executable'])
             self.assertTrue(Path(task['train_config']).is_file())
@@ -139,7 +139,7 @@ class TaskConfigTests(unittest.TestCase):
             self.assertIn('config_path', [arg.arg for arg in definition.args.kwonlyargs])
             self.assertNotIn('parse_known_args', source)
             self.assertLess(source.index('import distutils.version'), source.index('import torch.utils.tensorboard'))
-        for relative in ('01_RL.py', 'docking.py', 'task_config.py', 'scoring_workers.py'):
+        for relative in ('01_RL.py', 'docking.py', 'task_config.py', 'scoring_workers.py', 'run_state.py'):
             ast.parse((ROOT / 'RL_utils' / relative).read_text(), feature_version=(3, 8))
 
 

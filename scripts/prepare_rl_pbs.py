@@ -61,7 +61,7 @@ JOB_DIR={quote(str(directory))}
 REPO={quote(str(repo))}
 ENV_ROOT={quote(ENV_ROOT)}
 PY="$ENV_ROOT/bin/python"
-exec > "$JOB_DIR/launcher.log" 2>&1
+exec >> "$JOB_DIR/launcher.log" 2>&1
 echo "launcher_start=$(date -Is) host=$(hostname) job=${{PBS_JOBID:-unknown}}"
 trap 'rc=$?; echo "launcher_exit_status=$rc"; echo "launcher_end=$(date -Is)"; exit "$rc"' EXIT
 if [[ -r "${{PBS_NODEFILE:-}}" ]]; then
@@ -76,7 +76,7 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_TH
 export CUDA_VISIBLE_DEVICES={gpu}
 cd "$REPO"
 echo "git_commit=$(git rev-parse HEAD)"
-"$PY" -u -B RL_utils/01_RL.py --config "$JOB_DIR/task.yml"
+"$PY" -u -B RL_utils/01_RL.py --config "$JOB_DIR/task.yml" --resume-if-exists
 '''
 
 
@@ -146,7 +146,7 @@ def main(argv=None):
         print('PBS=' + str(directory / 'job.pbs'))
         print('qsub ' + shlex.quote(str(directory / 'job.pbs')))
     print('Prepared only; no jobs submitted. GPU selection does not reserve a GPU in PBS.')
-    print('Whole-RL resume is not implemented; use a new run ID for each independent run.')
+    print('Resubmitting the same PBS resumes its saved run; use a new run ID for independent runs.')
     return 0
 
 

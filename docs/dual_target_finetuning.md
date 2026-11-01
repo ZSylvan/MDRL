@@ -37,6 +37,11 @@ running. All other training settings remain in `train_MDRL_RL.yml`, including
 the original learning rate and scheduler settings. Sampling retains replacement
 sampling and the original output-path-dependent seed rule; it can overshoot the
 requested population size. It is not the fixed-attempt inference probe.
+All accepted samples are retained, including duplicates and any overshoot. The
+first update uses the initial population (approximately 3000), not a padded
+4000-molecule set. Later updates use the previous round's selected top 4000.
+The saved training population is the full pool before its 70/30 training and
+validation split; both split indices are recorded in training checkpoints.
 
 Each molecule's property score is the arithmetic mean of normalized QED, SA and
 the two ligand-efficiency predictions. The docking score is the mean of the two
@@ -52,7 +57,7 @@ CPU scoring models once. The two targets for one molecule are docked sequentiall
 Processes use `spawn` and do not inherit the training process's CUDA state.
 Generation and training stay sequential in the main process on one selected GPU.
 
-The templates use 4 workers, `docking.cpu: 1` and
+The templates use 16 workers, `docking.cpu: 1` and
 `scoring.predictor_threads: 1`. Choose these yourself for the CPU allocation;
 budget approximately `workers * max(cpu, predictor_threads)` active scoring
 threads. Training data-loader workers are a separate setting. No hostname,
@@ -81,7 +86,9 @@ correct. Replace the task filename for the other pairs.
 
 The training entry uses the same command without `--check-config`. Optional
 `--device` and `--output` override those two task settings. The output directory
-must not already exist; choose a separate directory for each independent run.
+must not already exist for a new run; choose a separate directory for each
+independent run. Use `--resume` to continue a supported existing run, or
+`--resume-if-exists` to continue when saved state exists and start otherwise.
 No experiment is started by importing the entry.
 
 ## PBS preparation on the server
@@ -110,15 +117,44 @@ jobs are running, since the code itself is not copied into the run directory.
 PBS files are prepared only; no job is submitted. Inspect the generated task
 and resource settings before using `qsub`. Jobs configured for the same GPU
 should be submitted sequentially, or edited to use separately chosen resources.
+Newly generated PBS files use `--resume-if-exists` and append to `launcher.log`.
+After a job has stopped, resubmitting the same PBS continues its saved run.
+Previously generated PBS files do not gain this behavior automatically. Never
+run two jobs against the same output directory at the same time.
 
 ## Saved results and numerical failures
 
 The output contains the source/resolved task configs, effective training and
 sampling configs, generated scoring CSV, and one `round_000`, `round_001`, etc.
-directory. Each round retains all raw and normalized per-molecule scores in
-`scores.jsonl`, target-specific Vina output under `docking/mol_*/`, and selected
-SDFs plus `population/mol_summary.csv`. Indices in scores refer to that round's
-pre-selection population; the SMILES identifies the molecule after re-ranking.
+directory. Samples and model weights are kept separately:
+
+```text
+pretrained_985000.pt
+round_000/
+  generated/                  # Initial generated population (target 3000)
+  population/                 # Scored initial population
+round_001/                    # Same layout for every later update round
+  training_population/        # Full input pool used by this round's training
+  generated/                  # Only this round's newly generated samples (target 2000)
+  population/                 # Selected top 4000 for the next update
+  checkpoints/final.pt        # This round's final complete training checkpoint
+  training/*/checkpoints/     # All validation checkpoints, round/iteration in names
+  sampling/batches/           # Completed sampling batches for recovery
+```
+
+Every population directory contains numbered SDF files, `mol_summary.csv`,
+`population.pt` (full molecule dictionaries for recovery) and a `manifest.json`
+recording the actual count. Duplicate molecules have separate numbered files;
+no deduplication or count padding is performed. Each training population is an
+independent saved copy, not just a pointer to the previous selected population.
+All round weights and intermediate checkpoints are retained without pruning.
+
+Each round retains all raw and normalized per-molecule scores in `scores.jsonl`
+and target-specific Vina output under `docking/mol_*/attempt_*/`. A retry uses a
+new attempt directory rather than overwriting the previous docking files.
+Indices in scores refer to that round's pre-selection population (old pool
+followed by newly generated samples); the SMILES identifies the molecule after
+re-ranking. Duplicate SMILES remain distinguishable by their molecule index.
 `rounds.jsonl` records each completed round's source/result checkpoint and pool.
 
 Training logs contain `train.jsonl`, `validation.jsonl`, AMP skipped updates and
@@ -132,8 +168,35 @@ updates or invalid checkpoint parameters stop the task. The first fatal training
 failure saves `diagnostics/first_failure.pt` with the batch, losses, RNG state,
 model/optimizer/scaler and gradients. It is diagnostic-only, not a resume input.
 
-Whole-RL restart/resume is NOT implemented: an existing output directory is
-refused. Checkpoints can be independently evaluated, but this must not be confused
-with restoration of the population, scoring stage and overall RL round. Adding
-round-level restart is a separate follow-up; copying a pretraining resume flag is
-not sufficient.
+## Resume behavior
+
+Run the same task with `--resume`, for example:
+
+```bash
+python -B RL_utils/01_RL.py --config RL_utils/config_RL/tasks/chk1_auroraa.yml --resume
+```
+
+Use the task file belonging to the original run, including its original output
+directory. Completed rounds and completed stages are reused. Recovery uses:
+
+- Sampling: completed batch files and their random state; only an interrupted
+  in-flight batch needs to be generated again.
+- Scoring: completed per-molecule `scores.jsonl` records; only unfinished
+  molecules are scored again. An unfinished trailing record is discarded.
+- Training: the latest complete checkpoint in that round, including model,
+  optimizer, scheduler, AMP scaler, iteration, split indices and random state.
+  With the defaults, checkpoints are saved at iterations 5000 and 10000; any
+  later unsaved updates are repeated. If no checkpoint exists, that round's
+  training restarts, but its earlier completed stages remain saved.
+
+The data-loader shuffle/prefetch position is not restored, so the continued
+training is not guaranteed to be bit-for-bit identical to an uninterrupted run.
+Normal round-to-round transitions still initialize only model parameters and
+start fresh optimizers; full optimizer restoration is only for an interrupted
+training round. The pinned `pretrained_985000.pt` is reused even if the original
+source `last.pt` has since moved or changed.
+
+Resume requires the saved `run_state.json` format and unchanged task/training/
+sampling settings. Device and scoring CPU concurrency settings may change.
+Legacy output directories without saved run state are not automatically
+migrated. Diagnostic-only failure snapshots are never used for recovery.

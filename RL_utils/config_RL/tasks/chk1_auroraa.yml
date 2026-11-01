@@ -20,7 +20,7 @@ scoring:
   sa: {mu: 3.0, sigma: 0.5, minimize: true}
   ligand_efficiency: {mu: 0.8, sigma: 0.3, minimize: false}
 docking:
-  workers: 4
+  workers: 16
   executable: /home/zhuenqiang_1/.conda/envs/MDRL/bin/vina
   cpu: 1
   timeout: null
