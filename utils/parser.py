@@ -97,8 +97,8 @@ def parse_drug3d_mol(mol, smiles=None):
         row += [b_index[0], b_index[1]]
         col += [b_index[1], b_index[0]]
     
-    bond_type = np.array(bond_type, dtype=np.long)
-    bond_index = np.array([row, col],dtype=np.long)
+    bond_type = np.array(bond_type, dtype=np.int64)
+    bond_index = np.array([row, col],dtype=np.int64)
 
     perm = (bond_index[0] * num_atoms + bond_index[1]).argsort()
     bond_index = bond_index[:, perm]

@@ -108,9 +108,9 @@ class Drug3DDataset(Dataset):
                         key = str(mol_id).encode(),
                         value = pickle.dumps(data)
                     )
-                except:
+                except Exception as exc:
                     num_skipped += 1
-                    print('Skipping (%d) Num: %s, %s' % (num_skipped, mol_id, smiles))
+                    print('Skipping (%d) Num: %s, %s | %r' % (num_skipped, mol_id, smiles, exc))
                     continue
         db.close()
         print('Processed %d molecules' % (len(df_use) - num_skipped), 'Skipped %d molecules' % num_skipped)
