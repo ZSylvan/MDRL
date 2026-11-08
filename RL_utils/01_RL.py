@@ -14,7 +14,9 @@ if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from RL_utils.task_config import append_record, load_task_config, write_scoring_csv
-from RL_utils.run_state import find_training_checkpoint, load_state, save_state, write_json
+from RL_utils.run_state import (
+    find_training_checkpoint, load_state, save_state, with_train_batch_size, write_json,
+)
 
 
 def save_population(population, directory):
@@ -91,7 +93,9 @@ def _effective_config(source, section, overrides, seed, destination):
     return config
 
 
-def run(config, source, resume=False):
+def run(config, source, resume=False, resume_train_batch_size=None):
+    if resume_train_batch_size is not None and not resume:
+        raise ValueError('--resume-train-batch-size requires an existing run and --resume/--resume-if-exists')
     import numpy as np
     import torch
     import yaml
@@ -114,7 +118,24 @@ def run(config, source, resume=False):
         for path in (initial_snapshot, train_path, sample_path, scoring_path):
             if not path.is_file():
                 raise FileNotFoundError(path)
-        append_record(output / 'resumes.jsonl', dict(device=config['device'], docking=config['docking']))
+        previous_batch_size = version.get('resume_train_batch_size')
+        if resume_train_batch_size is None:
+            resume_train_batch_size = previous_batch_size
+        if resume_train_batch_size is not None:
+            with train_path.open() as handle:
+                original_training = yaml.safe_load(handle)
+            effective = with_train_batch_size(original_training, resume_train_batch_size)
+            if previous_batch_size is not None:
+                previous = with_train_batch_size(original_training, previous_batch_size)
+                with_train_batch_size(previous, resume_train_batch_size)
+            if previous_batch_size != resume_train_batch_size:
+                version['resume_train_batch_size'] = resume_train_batch_size
+                write_json(output / 'run_state.json', version)
+            print('RL|Resume training batch size: %d (original %d)' %
+                  (effective['train']['batch_size'], original_training['train']['batch_size']), flush=True)
+        append_record(output / 'resumes.jsonl', dict(
+            device=config['device'], docking=config['docking'],
+            resume_train_batch_size=resume_train_batch_size))
     else:
         # Fine-tuning initializes the model, not pretraining optimizer/progress.
         checkpoint = load_state(config['initial_checkpoint'])
@@ -177,7 +198,9 @@ def run(config, source, resume=False):
                 recovery = find_training_checkpoint(round_dir / 'training', epoch) if resume else None
                 trained = train_forRL(str(training_pool), epoch, model_ckpt,
                                       config_path=str(train_path), device=config['device'],
-                                      logdir=str(round_dir / 'training'), resume_from=recovery)
+                                      logdir=str(round_dir / 'training'), resume_from=recovery,
+                                      **({'resume_train_batch_size': resume_train_batch_size}
+                                         if resume_train_batch_size is not None else {}))
                 final = round_dir / 'checkpoints' / 'final.pt'
                 final.parent.mkdir(exist_ok=True)
                 shutil.copyfile(trained, str(final) + '.tmp')
@@ -233,6 +256,8 @@ def main(argv=None):
     parser.add_argument('--output', help='Override the new output directory')
     parser.add_argument('--resume', action='store_true', help='Continue this task in its existing output directory')
     parser.add_argument('--resume-if-exists', action='store_true', help='Resume a saved run, otherwise start a new run')
+    parser.add_argument('--resume-train-batch-size', type=int,
+                        help='Explicitly reduce training batch size during resume; persists for later rounds/resumes')
     parser.add_argument('--check-config', action='store_true', help='Read inputs only; no models, sampling, or docking')
     args = parser.parse_args(argv)
     config = load_task_config(args.config, check_files=not (args.resume or args.resume_if_exists))
@@ -246,7 +271,8 @@ def main(argv=None):
     if args.check_config:
         print(json.dumps(config, indent=2, allow_nan=False))
         return 0
-    run(config, Path(args.config).resolve(), resume=resume)
+    run(config, Path(args.config).resolve(), resume=resume,
+        resume_train_batch_size=args.resume_train_batch_size)
     return 0
 
 

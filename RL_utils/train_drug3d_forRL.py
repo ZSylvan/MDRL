@@ -23,6 +23,7 @@ from utils.train import *
 from RL_utils.task_config import append_record
 from RL_utils.run_state import (
     capture_rng, load_state, restore_training_components, save_state, validate_round_checkpoint,
+    with_train_batch_size, write_json,
 )
 from utils.pretrain_checks import (
     NonfiniteTrainingError, cpu_tree, handle_amp_gradient,
@@ -33,17 +34,21 @@ from utils.pretrain_checks import (
 def capture_training_rng(device):
     return capture_rng(device)
 
-def train_forRL(root, epoch_now, model_ckpt, *, config_path, device, logdir, resume_from=None):
+def train_forRL(root, epoch_now, model_ckpt, *, config_path, device, logdir, resume_from=None,
+                resume_train_batch_size=None):
     args = SimpleNamespace(config=config_path, device=device, logdir=logdir)
 
     # Load configs
     config = load_config(args.config)
+    if resume_train_batch_size is not None:
+        config = with_train_batch_size(config, resume_train_batch_size)
     config.dataset.root = root
     config_name = os.path.basename(args.config)[:os.path.basename(args.config).rfind('.')]
     seed_all(config.train.seed)
     resumed = load_state(resume_from) if resume_from is not None else None
     if resumed is not None:
-        validate_round_checkpoint(resumed, config, root, epoch_now, model_ckpt)
+        validate_round_checkpoint(resumed, config, root, epoch_now, model_ckpt,
+                                  allow_train_batch_size_decrease=resume_train_batch_size is not None)
         if resumed['iteration'] == config.train.max_iters:
             return str(resume_from)
 
@@ -58,6 +63,10 @@ def train_forRL(root, epoch_now, model_ckpt, *, config_path, device, logdir, res
     # logger.info(args)
     # logger.info(config)
     shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
+    write_json(os.path.join(log_dir, 'config.effective.json'), config)
+    if resume_train_batch_size is not None:
+        logger.warning('Explicit resume training batch size: %d; checkpoint: %s',
+                       config.train.batch_size, resume_from)
 
     # Transforms
     featurizer = FeaturizeMol(config.chem.atomic_numbers, config.chem.mol_bond_types,
@@ -89,6 +98,7 @@ def train_forRL(root, epoch_now, model_ckpt, *, config_path, device, logdir, res
         val_set = Subset(dataset, split['validation_indices'])
     append_record(os.path.join(log_dir, 'dataset.jsonl'), dict(
         root=root, source_checkpoint=model_ckpt, resume_from=resume_from,
+        train_batch_size=config.train.batch_size,
         train_indices=train_set.indices, validation_indices=val_set.indices))
     logger.info(f"Dataset length: {len(dataset)}")
     print(f"train|Dataset length: {len(dataset)}")

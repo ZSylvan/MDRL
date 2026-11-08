@@ -200,3 +200,39 @@ Resume requires the saved `run_state.json` format and unchanged task/training/
 sampling settings. Device and scoring CPU concurrency settings may change.
 Legacy output directories without saved run state are not automatically
 migrated. Diagnostic-only failure snapshots are never used for recovery.
+
+### Explicitly reduce the training batch after an OOM
+
+After syncing this code, an existing run may explicitly request a smaller
+training batch without editing its original `task.yml`, `task_resolved.json`
+or `train.yml`. For example, **only when 16 is no larger than the current batch**:
+
+```bash
+python -B RL_utils/01_RL.py --config /path/to/original/run/task.yml \
+  --resume --resume-train-batch-size 16
+```
+
+This option requires an existing run; it cannot initialize a new run. The new
+batch must be a positive integer and cannot exceed either the original batch,
+the previously requested resume batch, or the interrupted checkpoint's batch.
+Checkpoint compatibility is relaxed only for this explicit batch decrease;
+model, optimizer settings, dataset/split, round and source checks still apply.
+The model, optimizer, scheduler, AMP scaler and RNG are restored normally from
+the latest complete training checkpoint. Completed rounds and saved sample/
+score stages are reused. An iteration-5000 checkpoint resumes at 5001, not at
+the last unsaved iteration printed before failure. Diagnostic snapshots remain
+ineligible for resume.
+
+The smaller batch is recorded in `run_state.json` and `resumes.jsonl`, applies to
+the unfinished training round and later training rounds, and is reused by later
+resumes even if the flag is omitted. Each new training segment also saves its
+actual configuration as `config.effective.json`; checkpoint `config` records the
+actual batch. Original task/config files, old logs and checkpoints are preserved.
+
+Both training and validation loaders use this batch size. Sampling batch,
+generation counts, rewards, learning rate and maximum iterations are unchanged;
+no gradient accumulation or automatic learning-rate scaling is introduced.
+Consequently the number of molecule presentations per iteration changes, and
+this is not an exact continuation of the original batch-size trajectory or an
+unchanged official-batch reproduction. A smaller batch reduces memory pressure
+but does not guarantee that every future molecular graph fits the GPU.

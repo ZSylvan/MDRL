@@ -1,5 +1,6 @@
 """Persist completed RL work without importing models or initializing CUDA."""
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -84,13 +85,31 @@ def find_training_checkpoint(directory, epoch):
     return str(max(candidates)[1]) if candidates else None
 
 
-def validate_round_checkpoint(saved, config, root, epoch, source_checkpoint):
+def with_train_batch_size(config, batch_size):
+    """Copy a training config, permitting only a positive batch-size decrease."""
+    previous = config['train']['batch_size']
+    if type(batch_size) is not int or batch_size <= 0:
+        raise ValueError('Resume training batch size must be a positive integer')
+    if type(previous) is not int or previous <= 0 or batch_size > previous:
+        raise ValueError('Resume training batch size cannot increase: %s -> %s' %
+                         (previous, batch_size))
+    updated = copy.deepcopy(config)
+    updated['train']['batch_size'] = batch_size
+    return updated
+
+
+def validate_round_checkpoint(saved, config, root, epoch, source_checkpoint,
+                              allow_train_batch_size_decrease=False):
     from utils.pretrain_checks import validate_resume_numerics
 
     required = {'config', 'model', 'optimizer', 'scheduler', 'scaler', 'iteration', 'round',
                 'source_checkpoint', 'dataset_root', 'dataset_split', 'rng_state', 'amp_skipped_updates'}
-    if (not isinstance(saved, dict) or not required <= saved.keys() or
-            saved.get('diagnostic_only') or saved['round'] != epoch or saved['config'] != config or
+    if not isinstance(saved, dict) or not required <= saved.keys():
+        raise ValueError('Checkpoint is not a compatible checkpoint for this RL round')
+    saved_config = saved['config']
+    if allow_train_batch_size_decrease:
+        saved_config = with_train_batch_size(saved_config, config['train']['batch_size'])
+    if (saved.get('diagnostic_only') or saved['round'] != epoch or saved_config != config or
             saved['dataset_root'] != root or saved['source_checkpoint'] != source_checkpoint or
             type(saved['iteration']) is not int or not 0 <= saved['iteration'] <= config['train']['max_iters']):
         raise ValueError('Checkpoint is not a compatible checkpoint for this RL round')

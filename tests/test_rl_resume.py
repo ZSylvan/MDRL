@@ -198,7 +198,76 @@ class RLResumeTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 run_state.validate_round_checkpoint(dict(saved, **change), config, 'pool', 1, 'init.pt')
 
-    def exercise_interruption(self, stage):
+    def test_batch_override_is_explicit_and_does_not_relax_other_checkpoint_checks(self):
+        original = dict(train=dict(max_iters=10000, use_amp=False, batch_size=24, lr=1e-6),
+                        model=dict(name='diffusion'))
+        reduced = run_state.with_train_batch_size(original, 16)
+        self.assertEqual(original['train']['batch_size'], 24)
+        saved = dict(config=original, model=dict(w=torch.ones(1)), optimizer={}, scheduler={}, scaler={},
+                     iteration=5000, round=8, source_checkpoint='previous.pt', dataset_root='pool',
+                     dataset_split={}, rng_state={}, amp_skipped_updates=0)
+        with self.assertRaises(ValueError):
+            run_state.validate_round_checkpoint(saved, reduced, 'pool', 8, 'previous.pt')
+        run_state.validate_round_checkpoint(saved, reduced, 'pool', 8, 'previous.pt',
+                                           allow_train_batch_size_decrease=True)
+        for change in ('lr', 'model', 'diagnostic', 'weights', 'round', 'source', 'dataset'):
+            changed = copy.deepcopy(saved)
+            if change == 'lr':
+                changed['config']['train']['lr'] = 0.1
+            elif change == 'model':
+                changed['config']['model']['name'] = 'different'
+            elif change == 'diagnostic':
+                changed['diagnostic_only'] = True
+            elif change == 'weights':
+                changed['model']['w'] = torch.tensor([float('nan')])
+            elif change == 'round':
+                changed['round'] = 7
+            elif change == 'source':
+                changed['source_checkpoint'] = 'other.pt'
+            else:
+                changed['dataset_root'] = 'other-pool'
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run_state.validate_round_checkpoint(changed, reduced, 'pool', 8, 'previous.pt',
+                                                   allow_train_batch_size_decrease=True)
+        for invalid in (0, -1, True, 16.5, 32):
+            with self.subTest(batch=invalid), self.assertRaises(ValueError):
+                run_state.with_train_batch_size(original, invalid)
+        smaller_saved = dict(saved, config=run_state.with_train_batch_size(original, 8))
+        with self.assertRaises(ValueError):
+            run_state.validate_round_checkpoint(smaller_saved, reduced, 'pool', 8, 'previous.pt',
+                                               allow_train_batch_size_decrease=True)
+
+    def test_actual_trainer_applies_batch_override_before_checkpoint_validation(self):
+        tree = ast.parse((ROOT / 'RL_utils/train_drug3d_forRL.py').read_text())
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.FunctionDef) and node.name == 'train_forRL')
+        original = attribute_dict(dict(dataset=dict(root='placeholder'),
+            train=dict(batch_size=24, seed=2023, max_iters=10000, use_amp=False)))
+        saved_config = copy.deepcopy(original)
+        saved_config.dataset.root = 'pool'
+        saved = dict(config=saved_config, model=dict(w=torch.ones(1)), optimizer={}, scheduler={}, scaler={},
+                     iteration=5000, round=8, source_checkpoint='previous.pt', dataset_root='pool',
+                     dataset_split={}, rng_state={}, amp_skipped_updates=0)
+        validator = Mock(wraps=run_state.validate_round_checkpoint)
+        namespace = dict(SimpleNamespace=SimpleNamespace, os=os, load_config=lambda path: original,
+            with_train_batch_size=run_state.with_train_batch_size, seed_all=Mock(),
+            load_state=lambda path: saved, validate_round_checkpoint=validator,
+            get_new_log_dir=Mock(side_effect=RuntimeError('stop before dataset/model setup')))
+        exec(compile(ast.Module(body=[function], type_ignores=[]), '<RL batch override fixture>', 'exec'), namespace)
+        with self.assertRaisesRegex(RuntimeError, 'stop before dataset/model setup'):
+            namespace['train_forRL']('pool', 8, 'previous.pt', config_path='train.yml',
+                device='cpu', logdir='unused', resume_from='ordinary5000.pt', resume_train_batch_size=16)
+        self.assertEqual(validator.call_args.args[1].train.batch_size, 16)
+        self.assertTrue(validator.call_args.kwargs['allow_train_batch_size_decrease'])
+        self.assertEqual(original.train.batch_size, 24)
+        self.assertEqual(saved['iteration'], 5000)
+
+    def test_batch_override_cannot_start_a_new_run(self):
+        entry = entry_module()
+        with self.assertRaisesRegex(ValueError, 'requires an existing run'):
+            entry.run({}, ROOT / 'unused.yml', resume_train_batch_size=16)
+
+    def exercise_interruption(self, stage, resume_batch_size=None):
         entry = entry_module()
         source = ROOT / 'RL_utils/config_RL/tasks/chk1_auroraa.yml'
         config = load_task_config(source, check_files=False)
@@ -254,12 +323,26 @@ class RLResumeTests(unittest.TestCase):
                 if stage == 'short_sampling':
                     self.assertFalse((directory / 'output/round_001/generated/manifest.json').exists())
                 checkpoint.unlink()
-                entry.run(config, source, resume=True)
+                entry.run(config, source, resume=True, resume_train_batch_size=resume_batch_size)
             self.assertEqual(sampler.call_count, 4 if stage in ('sampling', 'short_sampling') else 3)
             self.assertEqual(trainer.call_count, 3 if stage == 'training' else 2)
             if stage == 'training':
                 self.assertEqual(trainer.call_args_list[1].kwargs['resume_from'], str(recovery_path))
             output = directory / 'output'
+            if resume_batch_size is not None:
+                self.assertEqual(trainer.call_args_list[1].kwargs['resume_train_batch_size'], resume_batch_size)
+                self.assertEqual(trainer.call_args_list[2].kwargs['resume_train_batch_size'], resume_batch_size)
+                state = json.loads((output / 'run_state.json').read_text())
+                self.assertEqual(state['resume_train_batch_size'], resume_batch_size)
+                original = yaml.safe_load((output / 'train.yml').read_text())
+                self.assertEqual(original['train']['batch_size'], config['train_overrides']['batch_size'])
+                # Re-submitting the unchanged original PBS retains the smaller batch.
+                with patch.dict('sys.modules', modules):
+                    entry.run(config, source, resume=True)
+                latest = run_state.read_records(output / 'resumes.jsonl')[-1]
+                self.assertEqual(latest['resume_train_batch_size'], resume_batch_size)
+                with patch.dict('sys.modules', modules), self.assertRaises(ValueError):
+                    entry.run(config, source, resume=True, resume_train_batch_size=resume_batch_size + 1)
             for epoch, count in ((0, 3), (1, 2), (2, 2)):
                 generated = entry.load_population(output / ('round_%03d/generated' % epoch))
                 self.assertEqual(len(generated), count)
@@ -276,6 +359,9 @@ class RLResumeTests(unittest.TestCase):
 
     def test_resume_after_training_interruption(self):
         self.exercise_interruption('training')
+
+    def test_resume_training_with_smaller_batch_reuses_saved_work(self):
+        self.exercise_interruption('training', resume_batch_size=8)
 
     def test_resume_after_sampling_interruption_does_not_retrain(self):
         self.exercise_interruption('sampling')
