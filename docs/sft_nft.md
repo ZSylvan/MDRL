@@ -184,3 +184,14 @@ PBS生成/提交、Git提交/推送或服务器操作。
 测试命令为 python -B -m pytest -q -p no:cacheprovider；
 原有Git Bash/MSYS测试需要正常本地权限，受限权限下的失败已分别复核。
 六份YAML的schema-only入口通过；不等于真实服务器输入预检通过。
+
+SA_Score兼容：优先导入 `rdkit.Contrib.SA_Score.sascorer`，旧版布局回退到
+`RDConfig.RDContribDir/SA_Score/sascorer.py`，并兼容旧 loader 对
+`fpscores.pkl.gz` 的追加后缀行为。服务器预检仍须确认 RDKit/OpenBabel/Vina、
+受体、LE 模型和指定 SA score 表均可用。
+
+本次兼容修复：微调相关40项通过，独立评分兼容回归14项通过。
+完整仓库回归为165 passed、2 skipped、55 subtests passed，另6项Git Bash/MSYS
+测试在受限权限下失败；提升权限单独复跑该6项全部通过（合计171项通过）。
+作者已回传服务器985000步权重CPU严格加载及有限性检查通过；
+本修复尚待同步后重新执行三组SFT的`--validate-only`，不代表GPU/对接/训练验收。

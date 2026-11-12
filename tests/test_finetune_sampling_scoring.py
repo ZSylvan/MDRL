@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 from rdkit import Chem
-from rdkit.Contrib.SA_Score import sascorer
+from mdrl_finetune.scoring import _load_sascorer
 from mdrl_finetune import sampling, scoring
 from test_finetune_config import base
 from test_finetune_training import Tiny
@@ -107,6 +107,7 @@ class Predictor:
 
 def test_sft_four_property_components_and_nft_docking_only(tmp_path):
     cfg = base()
+    sascorer = _load_sascorer()
     cfg["scoring"]["fscores"] = str(Path(sascorer.__file__).parent / "fpscores.pkl.gz")
     model_path = tmp_path / "model.pkl"
     with model_path.open("wb") as handle:

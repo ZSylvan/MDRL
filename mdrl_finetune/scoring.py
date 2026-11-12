@@ -12,6 +12,42 @@ import subprocess
 import numpy as np
 
 
+def _load_sascorer():
+    """Load RDKit's canonical SA_Score module across old/new layouts."""
+    try:
+        from rdkit.Contrib.SA_Score import sascorer
+        return sascorer
+    except ModuleNotFoundError as exc:
+        # Only the absent package layout is eligible for fallback.  Missing
+        # transitive dependencies inside an installed module must propagate.
+        if exc.name not in {"rdkit.Contrib", "rdkit.Contrib.SA_Score", "rdkit.Contrib.SA_Score.sascorer"}:
+            raise
+        from rdkit import RDConfig
+        import importlib.util
+        source = Path(RDConfig.RDContribDir) / "SA_Score" / "sascorer.py"
+        if not source.is_file():
+            raise FileNotFoundError("RDKit SA_Score module not found: " + str(source)) from exc
+        spec = importlib.util.spec_from_file_location("mdrl_finetune_sascorer", str(source))
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module
+
+
+def _read_fragment_scores(sascorer, scores_path):
+    path = Path(scores_path)
+    if not path.is_file():
+        raise FileNotFoundError("Missing trusted SA fragment scores: " + str(path))
+    try:
+        sascorer.readFragmentScores(str(path))
+    except FileNotFoundError as exc:
+        expected = str(path) + ".pkl.gz"
+        if not str(path).endswith(".pkl.gz") or str(getattr(exc, "filename", "")) != expected:
+            raise
+        # RDKit 2022's loader appends .pkl.gz; newer versions accept the full path.
+        sascorer.readFragmentScores(str(path)[:-len(".pkl.gz")])
+
+
 def capped_gaussian(value, mu, sigma, minimize=True):
     if not all(math.isfinite(float(x)) for x in (value, mu, sigma)) or sigma <= 0:
         raise ValueError("invalid Gaussian score")
@@ -27,7 +63,7 @@ def ligand_efficiency(prediction, hydrogen_count):
 
 def preflight_scoring(config, stage="sft"):
     from rdkit import Chem
-    from rdkit.Contrib.SA_Score import sascorer
+    sascorer = _load_sascorer()
     from openbabel import openbabel
 
     scoring = config["scoring"]
@@ -43,7 +79,7 @@ def preflight_scoring(config, stage="sft"):
     conversion = openbabel.OBConversion()
     if not conversion.SetInAndOutFormats("sdf", "pdbqt"):
         raise RuntimeError("OpenBabel SDF/PDBQT plugins are unavailable")
-    sascorer.readFragmentScores(str(Path(scoring["fscores"]).resolve()))
+    _read_fragment_scores(sascorer, Path(scoring["fscores"]).resolve())
     return True
 
 
@@ -71,10 +107,11 @@ def _run_vina(ligand, target, settings, seed, log):
 
 class _ScorerCore:
     def __init__(self, config, stage):
-        from rdkit.Contrib.SA_Score import sascorer
+        sascorer = _load_sascorer()
 
         self.config, self.stage = config, stage
-        sascorer.readFragmentScores(str(Path(config["scoring"]["fscores"]).resolve()))
+        _read_fragment_scores(sascorer, Path(config["scoring"]["fscores"]).resolve())
+        self.sascorer = sascorer
         self.le_models = []
         if stage == "sft":
             for target in config["targets"]:
@@ -90,7 +127,7 @@ class _ScorerCore:
     def score(self, molecule, directory):
         from rdkit import Chem
         from rdkit.Chem import AllChem, QED
-        from rdkit.Contrib.SA_Score import sascorer
+        sascorer = self.sascorer
         from RL_utils.docking import sdf_to_pdbqt
 
         try:
