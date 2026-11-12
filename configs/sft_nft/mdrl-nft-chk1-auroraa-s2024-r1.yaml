@@ -1,0 +1,52 @@
+stage: nft
+seed: 2024
+model:
+  checkpoint: /home/zhuenqiang_1/Student_Project/zms/experiment_data/mdrl/pretrain/mdrl-b16-amp-resume-20261030T141531Z/training/config_20261030_224031/checkpoints/last.pt
+  expected_iteration: 985000
+  architecture:
+    elements: [C, N, O, F, P, S, Cl]
+    n_timesteps: 1000
+    conditioning: unconditional
+targets:
+  - id: CHK1
+    receptor: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/targets/target_pair_00004/CHK1_protein.pdbqt
+    center: [13.4734, -4.2531, 14.1905]
+    box_size: 24
+    mu: -10.0
+    sigma: 1.0
+    le_model: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/xgboost/O14757_xgbr_ligand_model.pkl
+    le_mu: 0.5
+    le_sigma: 0.1
+  - id: AuroraA
+    receptor: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/targets/target_pair_00004/AuroraA_protein.pdbqt
+    center: [-11.9662, -25.4919, 7.1844]
+    box_size: 24
+    mu: -10.0
+    sigma: 1.0
+    le_model: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/xgboost/O14965_xgbr_ligand_model.pkl
+    le_mu: 0.5
+    le_sigma: 0.1
+scoring:
+  backend: existing_rl_utils
+  executable: /home/zhuenqiang_1/.conda/envs/MDRL/bin/vina
+  cpu: 1
+  fscores: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/reward_assets/fpscores.pkl.gz
+  workers: 16
+  timeout_s: 300
+  exhaustiveness: 8
+  num_modes: 1
+runtime:
+  device: cuda:0
+nft:
+  init_checkpoint: /home/zhuenqiang_1/Student_Project/zms/experiment_data/mdrl/sft_nft/server_runs/mdrl-sft8-chk1-auroraa-s2024-r1/final.pt
+  iterations: 100
+  attempts: 128
+  rollout_batch_size: 16
+  epochs: 4
+  micro_batch_size: 64
+  lr: 1.0e-5
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  beta: 1.0
+  anchor_coef: 1.0e-3
+  min_valid: 2

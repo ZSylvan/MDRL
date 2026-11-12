@@ -1,0 +1,50 @@
+stage: sft
+seed: 2024
+model:
+  checkpoint: /home/zhuenqiang_1/Student_Project/zms/experiment_data/mdrl/pretrain/mdrl-b16-amp-resume-20261030T141531Z/training/config_20261030_224031/checkpoints/last.pt
+  expected_iteration: 985000
+  architecture:
+    elements: [C, N, O, F, P, S, Cl]
+    n_timesteps: 1000
+    conditioning: unconditional
+targets:
+  - id: Thrombin
+    receptor: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/targets/target_pair_00002/Thrombin_protein.pdbqt
+    center: [15.9111, -11.219, 19.8419]
+    box_size: 24
+    mu: -10.0
+    sigma: 1.0
+    le_model: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/xgboost/P00734_xgbr_ligand_model.pkl
+    le_mu: 0.5
+    le_sigma: 0.1
+  - id: Trypsin
+    receptor: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/targets/target_pair_00002/Trypsin_protein.pdbqt
+    center: [-1.407, 5.4888, 20.7089]
+    box_size: 24
+    mu: -10.0
+    sigma: 1.0
+    le_model: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/xgboost/P00760_xgbr_ligand_model.pkl
+    le_mu: 0.5
+    le_sigma: 0.1
+scoring:
+  backend: existing_rl_utils
+  executable: /home/zhuenqiang_1/.conda/envs/MDRL/bin/vina
+  cpu: 1
+  fscores: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/reward_assets/fpscores.pkl.gz
+  workers: 16
+  timeout_s: 300
+  exhaustiveness: 8
+  num_modes: 1
+runtime:
+  device: cuda:0
+sft:
+  rounds: 8
+  initial_attempts: 3000
+  round_attempts: 2000
+  top_k: 4000
+  updates_per_round: 100
+  batch_size: 16
+  lr: 1.0e-5
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  generation_batch_size: 16
