@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import random
 import traceback
+from datetime import datetime, timezone
+import inspect
 import numpy as np
 import torch
 import yaml
@@ -156,6 +158,34 @@ def _record(out, metrics):
     print(json.dumps(metrics, allow_nan=False), flush=True)
 
 
+def _progress_payload(stage, round_idx, phase, event=None, **values):
+    payload = dict(timestamp=datetime.now(timezone.utc).isoformat(), stage=stage,
+                   round=round_idx, human_round=round_idx + 1, phase=phase)
+    if event is not None:
+        payload["event"] = event
+    payload.update(values)
+    return payload
+
+
+def _write_progress(out, round_dir, payload):
+    """Atomically publish authoritative run and current-round progress."""
+    write_json(out / "progress.json", payload)
+    if round_dir is not None:
+        write_json(round_dir / "sampling_progress.json", payload)
+
+
+def _sample_with_progress(sample, model, attempts, batch_size, device, callback):
+    # Injected samplers from older callers remain valid when they lack the new kwarg.
+    try:
+        accepts = "progress_callback" in inspect.signature(sample).parameters
+    except (TypeError, ValueError):
+        accepts = False
+    kwargs = dict(batch_size=batch_size, device=device)
+    if accepts:
+        kwargs["progress_callback"] = callback
+    return sample(model, attempts, **kwargs)
+
+
 def _quality_metrics(rows):
     successful = [row for row in rows if row.get("valid") and not row.get("failed")]
     affinities = {}
@@ -197,18 +227,70 @@ def run_sft(config, output, *, model=None, sampler=None, scorer=None, resume=Non
         for round_idx in range(start, section["rounds"]):
             directory = _round_directory(out, "round", round_idx)
             attempts = section["initial_attempts"] if round_idx == 0 else section["round_attempts"]
-            rows = sample(model, attempts, batch_size=section["generation_batch_size"], device=cfg["runtime"]["device"])
+            progress = {}
+            def on_progress(event):
+                progress.update(event)
+                completed_valid = event.get("completed_valid")
+                completed_invalid = event.get("completed_invalid")
+                if completed_valid is None:
+                    completed_valid = progress.get("completed_valid", 0)
+                if completed_invalid is None:
+                    completed_invalid = progress.get("completed_invalid", 0)
+                progress.update(_progress_payload("sft", round_idx, "sampling",
+                                                  event=event.get("event"),
+                                                  total_attempts=event.get("total_attempts"),
+                                                  completed_attempts=event.get("completed_attempts", 0),
+                                                  completed_valid=completed_valid,
+                                                  completed_invalid=completed_invalid,
+                                                  batch_index=event.get("batch_index"),
+                                                  total_batches=event.get("total_batches"),
+                                                  current_batch_size=event.get("current_batch_size"),
+                                                  steps_completed=event.get("steps_completed", 0),
+                                                  steps_total=event.get("steps_total", 1000),
+                                                  generation_fraction=(event.get("completed_attempts", 0) /
+                                                                       event.get("total_attempts", 1)
+                                                                       if event.get("total_attempts") else 0.0),
+                                                  batch_denoising_fraction=event.get("batch_denoising_fraction", 0.0)))
+                _write_progress(out, directory, progress)
+            on_progress({"event": "start", "total_attempts": attempts,
+                         "completed_attempts": 0, "completed_valid": 0,
+                         "completed_invalid": 0, "batch_index": 0,
+                         "total_batches": (attempts + section["generation_batch_size"] - 1) // section["generation_batch_size"],
+                         "current_batch_size": 0, "steps_completed": 0,
+                         "steps_total": 1000, "generation_fraction": 0.0})
+            rows = _sample_with_progress(sample, model, attempts,
+                                         section["generation_batch_size"],
+                                         cfg["runtime"]["device"], on_progress)
             if len(rows) != attempts:
                 raise ValueError("sampler must return exactly the requested ATTEMPTS")
+            reconstruction_valid = sum(bool(row.get("valid")) for row in rows)
+            reconstruction_invalid = attempts - reconstruction_valid
+            _write_progress(out, directory, _progress_payload(
+                "sft", round_idx, "scoring", total_attempts=attempts,
+                completed_attempts=attempts,
+                completed_valid=reconstruction_valid,
+                completed_invalid=reconstruction_invalid,
+                generation_fraction=1.0))
             rows = scorer.score_many(rows, directory)
             if len(rows) != attempts:
                 raise ValueError("scorer changed attempt count")
             require_finite([row["reward"] for row in rows], "SFT reward")
+            _write_progress(out, directory, _progress_payload(
+                "sft", round_idx, "scoring_complete", total_attempts=attempts,
+                completed_attempts=attempts, completed_valid=reconstruction_valid,
+                completed_invalid=reconstruction_invalid,
+                generation_fraction=1.0))
             _save_rows(directory, rows)
             successful = [row for row in rows if row.get("valid") and row.get("trainable")
                           and not row.get("failed") and row.get("smiles")]
             pool = update_cumulative_pool(pool, successful)
             selected = pool[:section["top_k"]]
+            _write_progress(out, directory, _progress_payload(
+                "sft", round_idx, "training", total_attempts=attempts,
+                completed_attempts=attempts,
+                completed_valid=reconstruction_valid,
+                completed_invalid=reconstruction_invalid,
+                generation_fraction=1.0))
             losses = sft_step(model, optimizer, [row["graph"] for row in selected],
                               updates=section["updates_per_round"], batch_size=section["batch_size"],
                               grad_clip=section["grad_clip"])
@@ -224,8 +306,16 @@ def run_sft(config, output, *, model=None, sampler=None, scorer=None, resume=Non
             atomic_save(directory / "checkpoint.pt", state)
             atomic_save(out / "checkpoints" / "last.pt", state)
             _record(out, metrics)
+            _write_progress(out, directory, _progress_payload(
+                "sft", round_idx, "round_complete", total_attempts=attempts,
+                completed_attempts=attempts,
+                completed_valid=reconstruction_valid,
+                completed_invalid=reconstruction_invalid, generation_fraction=1.0))
         atomic_save(out / "final.pt", state)
         write_json(out / "status.json", dict(status="COMPLETED", stage="sft", completed=state["completed"]))
+        _write_progress(out, None, _progress_payload(
+            "sft", section["rounds"] - 1, "sft_complete",
+            completed_rounds=section["rounds"], generation_fraction=1.0))
         return state
     except Exception as exc:
         _fail(out, "sft", exc)

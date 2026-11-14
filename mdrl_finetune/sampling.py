@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import json
+from datetime import datetime, timezone
 from .checkpoint import load_payload
 from .training import require_finite
 
@@ -76,8 +78,21 @@ def placeholder(count, device):
     return sizes, torch.cat(nodes), torch.cat(halves, dim=1), torch.cat(edge_batches), resampled
 
 
+def _emit_progress(callback, event, **fields):
+    """Emit one lightweight sampling event without touching model/RNG state."""
+    if callback is None:
+        return
+    payload = dict(timestamp=datetime.now(timezone.utc).isoformat(), event=event, **fields)
+    print(json.dumps(payload, separators=(",", ":"), allow_nan=False), flush=True)
+    if callback is not None:
+        callback(payload)
+
+
 @torch.no_grad()
-def reverse_predictions(model, count, batch_node, halfedge_index, batch_halfedge):
+def reverse_predictions(model, count, batch_node, halfedge_index, batch_halfedge,
+                        *, progress_callback=None, batch_index=None, total_batches=None,
+                        total_attempts=None, completed_attempts=0,
+                        completed_valid=0, completed_invalid=0):
     """Same native adjacent-step kernels, including the final t=0 draw."""
     from models.diffusion import log_sample_categorical
 
@@ -88,6 +103,7 @@ def reverse_predictions(model, count, batch_node, halfedge_index, batch_halfedge
     full_batch = torch.cat([batch_halfedge, batch_halfedge])
     if model.num_timesteps != 1000 or model.categorical_space != "discrete":
         raise ValueError("only native discrete 1000-step sampling is supported")
+    steps_completed = 0
     for step in reversed(range(model.num_timesteps)):
         time = torch.full((count,), step, dtype=torch.long, device=batch_node.device)
         prediction = model(node, position, batch_node, torch.cat([edge, edge]),
@@ -103,6 +119,19 @@ def reverse_predictions(model, count, batch_node, halfedge_index, batch_halfedge
             torch.log_softmax(prediction["pred_halfedge"], -1), log_edge,
             time, batch_halfedge, v0_prob=True)
         edge = model.edge_transition.onehot_encode(log_sample_categorical(log_edge))
+        steps_completed += 1
+        if steps_completed % 100 == 0 or steps_completed == model.num_timesteps:
+            _emit_progress(
+                progress_callback, "denoising", total_attempts=total_attempts,
+                completed_attempts=completed_attempts,
+                completed_valid=completed_valid, completed_invalid=completed_invalid,
+                batch_index=batch_index, total_batches=total_batches,
+                current_batch_size=count, steps_completed=steps_completed,
+                steps_total=model.num_timesteps,
+                generation_fraction=(completed_attempts / total_attempts
+                                     if total_attempts else 0.0),
+                batch_denoising_fraction=(steps_completed / model.num_timesteps),
+            )
     # Match the native sampling script's decode convention, NOT traj[-1].
     return prediction
 
@@ -176,13 +205,32 @@ def decode_prediction(node_logits, position, edge_logits, halfedge_index):
 
 
 @torch.no_grad()
-def sample_native(model, count, *, batch_size=16, device="cpu"):
+def sample_native(model, count, *, batch_size=16, device="cpu", progress_callback=None):
     model.eval()
     result = []
-    for start in range(0, count, batch_size):
+    total_batches = (count + batch_size - 1) // batch_size
+    _emit_progress(progress_callback, "start", total_attempts=count,
+                   completed_attempts=0, completed_valid=0, completed_invalid=0,
+                   batch_index=0, total_batches=total_batches,
+                   current_batch_size=0, steps_completed=0, steps_total=1000,
+                   generation_fraction=0.0)
+    for batch_index, start in enumerate(range(0, count, batch_size), 1):
         number = min(batch_size, count - start)
+        _emit_progress(progress_callback, "batch_start", total_attempts=count,
+                       completed_attempts=len(result), completed_valid=sum(bool(r.get("valid")) for r in result),
+                       completed_invalid=sum(not bool(r.get("valid")) for r in result),
+                       batch_index=batch_index, total_batches=total_batches,
+                       current_batch_size=number, steps_completed=0, steps_total=1000,
+                       generation_fraction=(len(result) / count if count else 1.0),
+                       batch_denoising_fraction=0.0)
         sizes, batch_node, halfedge_index, batch_halfedge, retries = placeholder(number, device)
-        prediction = reverse_predictions(model, number, batch_node, halfedge_index, batch_halfedge)
+        prediction = reverse_predictions(
+            model, number, batch_node, halfedge_index, batch_halfedge,
+            progress_callback=progress_callback, batch_index=batch_index,
+            total_batches=total_batches, total_attempts=count,
+            completed_attempts=len(result),
+            completed_valid=sum(bool(r.get("valid")) for r in result),
+            completed_invalid=sum(not bool(r.get("valid")) for r in result))
         offset = 0
         for index, size in enumerate(sizes):
             edge_mask = batch_halfedge == index
@@ -193,6 +241,21 @@ def sample_native(model, count, *, batch_size=16, device="cpu"):
             row["atom_count_resamples_in_batch"] = retries
             result.append(row)
             offset += int(size)
+        valid = sum(bool(r.get("valid")) for r in result)
+        _emit_progress(progress_callback, "batch_complete", total_attempts=count,
+                       completed_attempts=len(result), completed_valid=valid,
+                       completed_invalid=len(result) - valid, batch_index=batch_index,
+                       total_batches=total_batches, current_batch_size=number,
+                       steps_completed=1000, steps_total=1000,
+                       generation_fraction=(len(result) / count if count else 1.0),
+                       batch_denoising_fraction=1.0)
     if len(result) != count:
         raise RuntimeError("fixed-attempt sampler returned the wrong count")
+    valid = sum(bool(r.get("valid")) for r in result)
+    _emit_progress(progress_callback, "completed", total_attempts=count,
+                   completed_attempts=len(result), completed_valid=valid,
+                   completed_invalid=len(result) - valid, batch_index=total_batches,
+                   total_batches=total_batches, current_batch_size=0,
+                   steps_completed=1000, steps_total=1000, generation_fraction=1.0,
+                   batch_denoising_fraction=1.0)
     return result

@@ -47,4 +47,4 @@ sft:
   lr: 1.0e-5
   weight_decay: 1.0e-4
   grad_clip: 1.0
-  generation_batch_size: 16
+  generation_batch_size: 512

@@ -87,7 +87,7 @@ def validate_config(config, stage=None):
         raise ValueError("runtime.device must be cpu or cuda")
     defaults = (
         dict(rounds=8, initial_attempts=3000, round_attempts=2000, top_k=4000,
-             updates_per_round=100, batch_size=16, generation_batch_size=16)
+             updates_per_round=100, batch_size=16, generation_batch_size=512)
         if actual == "sft" else
         dict(iterations=100, attempts=128, rollout_batch_size=16, epochs=4,
              micro_batch_size=64, min_valid=2))

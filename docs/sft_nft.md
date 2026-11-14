@@ -54,7 +54,7 @@ SFT阶段的XGBoost资产需要由使用者环境提供，不自动安装。
 第一轮3000次尝试，其余每轮2000次，不补采成功分子。
 完整历史池与训练用Top4000分别保存，不只保存精英池。
 
-每轮100次更新，batch16，生成batch16；按排序池顺序循环、不shuffle。
+每轮100次更新，训练batch16，生成batch512；第一轮3000次尝试按512×5+440，后续2000次按512×3+464，按固定尝试数结束，不补采成功分子。按排序池顺序循环、不shuffle。
 AdamW学习率1e-5、weight_decay1e-4、默认betas、clip1；
 更新原生可训练参数，原本冻结的扩散常量保持冻结。
 不继承原生预训练的优化器状态、AMP、scheduler或额外坐标jitter。
@@ -163,6 +163,12 @@ scores.json、generated.sdf、metrics.json；
 SFT另有retained.pt、retained.json、该轮checkpoint.pt。
 run根目录有config.resolved.yaml、status.json、metrics.jsonl、
 checkpoints/last.pt与final.pt；NFT另保留Top10和best.pt。
+生成期间还原子更新输出根目录 `progress.json` 及当前 `round_XX/sampling_progress.json`，记录批次、
+已完成尝试（有效与无效重建之和；这里的有效仅指分子重建有效，不代表对接评分成功）、每100步去噪进度和阶段（sampling/scoring/training/sft_complete）。
+标准输出同步输出紧凑JSON事件；文件是PBS输出可能延迟时的权威进度。停止进程会丢失当前轮未保存样本，
+应使用新的输出目录保留旧run；generation_batch_size改变会使resume配置指纹失配。不要自动因OOM改批大小，
+OOM应直接失败并保留上一安全边界。三份SFT YAML已切换到512；重跑请使用新的 `mdrl-sft8-<pair>-s2024-r2`
+等目录，后续NFT用 `--init-checkpoint` 指向新的final.pt或另配NFT YAML，不默认继续读取r1输出。
 标准输出逐轮输出JSON；异常traceback写failure.json。
 检查reward/loss、梯度、clip范数、更新后的模型/优化器/EMA/reference；
 异常停止并标FAILED，不发布异常final，last仍为上一安全边界。
