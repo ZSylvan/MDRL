@@ -38,7 +38,7 @@ scoring:
 runtime:
   device: cuda:0
 nft:
-  init_checkpoint: /home/zhuenqiang_1/Student_Project/zms/experiment_data/mdrl/sft_nft/server_runs/mdrl-sft8-thrombin-trypsin-s2024-r1/final.pt
+  init_checkpoint: /home/zhuenqiang_1/Student_Project/zms/experiment_data/mdrl/sft_nft/server_runs/mdrl-sft8-thrombin-trypsin-s2024-r2/final.pt
   iterations: 100
   attempts: 128
   rollout_batch_size: 16
