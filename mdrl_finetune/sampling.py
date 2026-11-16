@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import json
 from datetime import datetime, timezone
-from .checkpoint import load_payload
+from .checkpoint import FORMAT, load_payload
 from .training import require_finite
 
 ATOMIC_NUMBERS = (6, 7, 8, 9, 15, 16, 17)
@@ -53,7 +53,12 @@ def load_native_model(checkpoint, device="cpu"):
     from models.model import MDRL
 
     payload = load_payload(checkpoint) if not isinstance(checkpoint, dict) else checkpoint
-    config = check_native_config(payload["config"])
+    # Native pretraining checkpoints use config; isolated fine-tune boundaries
+    # use config for the experiment and native_config for the architecture.
+    if payload.get("format") == FORMAT:
+        config = check_native_config(payload.get("native_config"))
+    else:
+        config = check_native_config(payload["config"])
     model = MDRL(_attributes(config["model"]), num_node_types=8, num_edge_types=6).to(device)
     model.load_state_dict(payload["model"], strict=True)
     require_finite(model.state_dict(), "loaded model")

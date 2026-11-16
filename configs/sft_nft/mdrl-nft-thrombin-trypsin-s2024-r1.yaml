@@ -31,7 +31,7 @@ scoring:
   executable: /home/zhuenqiang_1/.conda/envs/MDRL/bin/vina
   cpu: 1
   fscores: /home/zhuenqiang_1/Student_Project/zms/data/flowmol/reward_assets/fpscores.pkl.gz
-  workers: 16
+  workers: 32
   timeout_s: 300
   exhaustiveness: 8
   num_modes: 1
